@@ -246,7 +246,7 @@ export default function App() {
             </button>
             <button
               disabled={Boolean(busy) || !es.exists || !version}
-              title={!es.exists ? "Despliega Elasticsearch primero" : undefined}
+              title={!es.exists ? "Deploy Elasticsearch first" : undefined}
               onClick={() =>
                 run("kb-deploy", async () => {
                   await deployKibana(namespace, version);
@@ -257,7 +257,7 @@ export default function App() {
             </button>
             <button
               disabled={Boolean(busy) || !es.exists || !version}
-              title={!es.exists ? "Despliega Elasticsearch primero" : undefined}
+              title={!es.exists ? "Deploy Elasticsearch first" : undefined}
               onClick={openLogstashModal}
             >
               Deploy Logstash
@@ -268,7 +268,7 @@ export default function App() {
               disabled={portForwards.kibana.status !== "running"}
               title={
                 portForwards.kibana.status !== "running"
-                  ? "Activa el port-forward de Kibana primero"
+                  ? "Start the Kibana port-forward first"
                   : undefined
               }
               onClick={() =>
@@ -344,14 +344,14 @@ export default function App() {
 
         <div className="section-head">
           <h2>Instances</h2>
-          <p>Visible solo cuando el recurso existe</p>
+          <p>Shown only when the resource exists</p>
         </div>
 
         {!hasInstances ? (
           <section className="panel">
             <p className="empty-status">
-              No hay instancias quickstart en este namespace. Usa Deploy
-              Elasticsearch para empezar.
+              No quickstart instances in this namespace. Use Deploy Elasticsearch
+              to get started.
             </p>
           </section>
         ) : (
@@ -423,7 +423,7 @@ export default function App() {
                 <div>
                   <span>password</span>
                   <strong>
-                    {creds?.password || "(secret aún no disponible)"}
+                    {creds?.password || "(secret not available yet)"}
                   </strong>
                 </div>
               </div>
@@ -482,8 +482,8 @@ export default function App() {
           >
             <h2 id="logstash-modal-title">Deploy Logstash</h2>
             <p className="hint">
-              Pipeline <code>config.string</code> del quickstart. Puedes
-              editarla antes de aplicar el CR.
+              Quickstart pipeline <code>config.string</code>. You can edit it
+              before applying the CR.
             </p>
             <textarea
               value={logstashConfig}
@@ -619,7 +619,7 @@ function InstanceCard({
             title={
               canOpen
                 ? endpoint
-                : "Activa el port-forward primero (Access credentials & port-forward)"
+                : "Start the port-forward first (Access credentials & port-forward)"
             }
             onClick={() => window.open(endpoint, "_blank", "noreferrer")}
           >
