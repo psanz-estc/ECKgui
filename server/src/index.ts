@@ -4,6 +4,7 @@ import {
   deleteElasticsearch,
   deleteKibana,
   deleteLogstash,
+  destroyQuickstart,
   deployElasticsearch,
   deployKibana,
   deployLogstash,
@@ -195,6 +196,18 @@ app.delete("/api/logstash", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
     await deleteLogstash(namespace);
+    return { ok: true };
+  } catch (err) {
+    reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/quickstart", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await destroyQuickstart(namespace);
+    await stopAllPortForwards();
     return { ok: true };
   } catch (err) {
     reply.code(500);

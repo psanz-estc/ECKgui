@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 
-export type PortForwardTarget = "es" | "kibana";
+export type BuiltinPortForwardTarget = "es" | "kibana";
 
 export type PortForwardState = {
-  target: PortForwardTarget;
+  target: string;
   status: "running" | "stopped" | "error";
   namespace: string | null;
   localPort: number;
@@ -21,33 +21,58 @@ type ManagedForward = {
   message: string | null;
 };
 
-const TARGETS: Record<
-  PortForwardTarget,
+const BUILTIN: Record<
+  BuiltinPortForwardTarget,
   { service: string; localPort: number }
 > = {
   es: { service: "quickstart-es-http", localPort: 9200 },
   kibana: { service: "quickstart-kb-http", localPort: 5601 },
 };
 
-const forwards = new Map<PortForwardTarget, ManagedForward>();
+const forwards = new Map<string, ManagedForward>();
 
-function isTarget(value: string): value is PortForwardTarget {
+function isBuiltin(value: string): value is BuiltinPortForwardTarget {
   return value === "es" || value === "kibana";
 }
 
-export function parseTarget(value: string): PortForwardTarget {
-  if (!isTarget(value)) {
-    const err = new Error('target must be "es" or "kibana"') as Error & {
+export function serviceTargetKey(service: string, port: number): string {
+  return `svc:${service}:${port}`;
+}
+
+export function parseTarget(value: string): string {
+  const trimmed = decodeURIComponent(value).trim();
+  if (!trimmed) {
+    const err = new Error("target is required") as Error & { statusCode: number };
+    err.statusCode = 400;
+    throw err;
+  }
+  if (isBuiltin(trimmed) || trimmed.startsWith("svc:")) {
+    return trimmed;
+  }
+  const err = new Error(
+    'target must be "es", "kibana", or "svc:<service>:<port>"',
+  ) as Error & { statusCode: number };
+  err.statusCode = 400;
+  throw err;
+}
+
+function resolveTarget(target: string): { service: string; localPort: number } {
+  if (isBuiltin(target)) {
+    return BUILTIN[target];
+  }
+  const match = /^svc:([^:]+):(\d+)$/.exec(target);
+  if (!match) {
+    const err = new Error(`invalid service target: ${target}`) as Error & {
       statusCode: number;
     };
     err.statusCode = 400;
     throw err;
   }
-  return value;
+  return { service: match[1], localPort: Number(match[2]) };
 }
 
-function toState(target: PortForwardTarget): PortForwardState {
-  const cfg = TARGETS[target];
+function toState(target: string): PortForwardState {
+  const cfg = resolveTarget(target);
   const managed = forwards.get(target);
   if (!managed) {
     return {
@@ -74,32 +99,44 @@ function toState(target: PortForwardTarget): PortForwardState {
 export function getPortForwardStatus(): {
   es: PortForwardState;
   kibana: PortForwardState;
+  extras: PortForwardState[];
 } {
+  const extras = [...forwards.keys()]
+    .filter((key) => !isBuiltin(key))
+    .map((key) => toState(key))
+    .sort((a, b) => a.service.localeCompare(b.service) || a.localPort - b.localPort);
+
   return {
     es: toState("es"),
     kibana: toState("kibana"),
+    extras,
   };
 }
 
+export function getPortForwardState(target: string): PortForwardState {
+  return toState(parseTarget(target));
+}
+
 export async function startPortForward(
-  target: PortForwardTarget,
+  target: string,
   namespace: string,
 ): Promise<PortForwardState> {
-  const existing = forwards.get(target);
+  const key = parseTarget(target);
+  const existing = forwards.get(key);
   if (existing && existing.status === "running" && !existing.process.killed) {
     if (existing.namespace === namespace) {
-      return toState(target);
+      return toState(key);
     }
-    await stopPortForward(target);
+    await stopPortForward(key);
   }
 
-  const cfg = TARGETS[target];
+  const cfg = resolveTarget(key);
   const args = [
     "-n",
     namespace,
     "port-forward",
     `service/${cfg.service}`,
-    String(cfg.localPort),
+    `${cfg.localPort}:${cfg.localPort}`,
   ];
 
   const child = spawn("kubectl", args, {
@@ -114,7 +151,7 @@ export async function startPortForward(
     status: "running",
     message: null,
   };
-  forwards.set(target, managed);
+  forwards.set(key, managed);
 
   let settled = false;
 
@@ -150,7 +187,7 @@ export async function startPortForward(
     child.on("error", (err) => {
       managed.status = "error";
       managed.message = err.message;
-      forwards.delete(target);
+      forwards.delete(key);
       if (!settled) {
         settled = true;
         clearTimeout(timeout);
@@ -159,7 +196,7 @@ export async function startPortForward(
     });
 
     child.on("exit", (code, signal) => {
-      const current = forwards.get(target);
+      const current = forwards.get(key);
       if (current?.process !== child) return;
       if (current.status === "running") {
         current.status = "error";
@@ -170,7 +207,7 @@ export async function startPortForward(
                 current.message ? `: ${current.message}` : ""
               }`;
       }
-      forwards.delete(target);
+      forwards.delete(key);
       if (!settled) {
         settled = true;
         clearTimeout(timeout);
@@ -184,22 +221,21 @@ export async function startPortForward(
     if (managed.status === "error") {
       throw new Error(managed.message || "port-forward failed");
     }
-    return toState(target);
+    return toState(key);
   } catch (err) {
     if (!child.killed) {
       child.kill("SIGTERM");
     }
-    forwards.delete(target);
+    forwards.delete(key);
     throw err;
   }
 }
 
-export async function stopPortForward(
-  target: PortForwardTarget,
-): Promise<PortForwardState> {
-  const managed = forwards.get(target);
+export async function stopPortForward(target: string): Promise<PortForwardState> {
+  const key = parseTarget(target);
+  const managed = forwards.get(key);
   if (!managed) {
-    return toState(target);
+    return toState(key);
   }
 
   await new Promise<void>((resolve) => {
@@ -219,12 +255,10 @@ export async function stopPortForward(
     }, 2000);
   });
 
-  forwards.delete(target);
-  return toState(target);
+  forwards.delete(key);
+  return toState(key);
 }
 
 export async function stopAllPortForwards(): Promise<void> {
-  await Promise.all(
-    (["es", "kibana"] as PortForwardTarget[]).map((t) => stopPortForward(t)),
-  );
+  await Promise.all([...forwards.keys()].map((t) => stopPortForward(t)));
 }

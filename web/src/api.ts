@@ -12,6 +12,23 @@ export type PodInfo = {
   restarts: number;
 };
 
+export type ServicePortInfo = {
+  name: string;
+  port: number;
+  targetPort?: string | number;
+  nodePort?: number;
+  protocol: string;
+  forwardTarget: string;
+  command: string;
+};
+
+export type ServiceInfo = {
+  name: string;
+  type: string;
+  clusterIP?: string;
+  ports: ServicePortInfo[];
+};
+
 export type ResourceStatus = {
   name: string;
   exists: boolean;
@@ -22,6 +39,7 @@ export type ResourceStatus = {
   count?: number;
   pods: PodInfo[];
   configString?: string | null;
+  services?: ServiceInfo[];
   error?: string;
 };
 
@@ -141,16 +159,21 @@ export function deleteLogstash(namespace: string) {
   );
 }
 
+export function destroyQuickstart(namespace: string) {
+  return request<{ ok: boolean }>(
+    `/api/quickstart?namespace=${encodeURIComponent(namespace)}`,
+    { method: "DELETE" },
+  );
+}
+
 export function getCredentials(namespace: string) {
   return request<Credentials>(
     `/api/credentials?namespace=${encodeURIComponent(namespace)}`,
   );
 }
 
-export type PortForwardTarget = "es" | "kibana";
-
 export type PortForwardState = {
-  target: PortForwardTarget;
+  target: string;
   status: "running" | "stopped" | "error";
   namespace: string | null;
   localPort: number;
@@ -162,21 +185,37 @@ export type PortForwardState = {
 export type PortForwardStatus = {
   es: PortForwardState;
   kibana: PortForwardState;
+  extras: PortForwardState[];
 };
 
 export function getPortForwards() {
   return request<PortForwardStatus>("/api/port-forward");
 }
 
-export function startPortForward(target: PortForwardTarget, namespace: string) {
-  return request<PortForwardState>(`/api/port-forward/${target}`, {
-    method: "POST",
-    body: JSON.stringify({ namespace }),
-  });
+export function startPortForward(target: string, namespace: string) {
+  return request<PortForwardState>(
+    `/api/port-forward/${encodeURIComponent(target)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ namespace }),
+    },
+  );
 }
 
-export function stopPortForward(target: PortForwardTarget) {
-  return request<PortForwardState>(`/api/port-forward/${target}`, {
-    method: "DELETE",
-  });
+export function stopPortForward(target: string) {
+  return request<PortForwardState>(
+    `/api/port-forward/${encodeURIComponent(target)}`,
+    {
+      method: "DELETE",
+    },
+  );
+}
+
+export function findPortForwardState(
+  status: PortForwardStatus,
+  target: string,
+): PortForwardState | undefined {
+  if (target === "es") return status.es;
+  if (target === "kibana") return status.kibana;
+  return status.extras.find((item) => item.target === target);
 }

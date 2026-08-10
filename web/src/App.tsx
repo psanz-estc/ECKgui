@@ -4,9 +4,11 @@ import {
   deleteElasticsearch,
   deleteKibana,
   deleteLogstash,
+  destroyQuickstart,
   deployElasticsearch,
   deployKibana,
   deployLogstash,
+  findPortForwardState,
   getCluster,
   getCredentials,
   getElasticsearch,
@@ -19,7 +21,6 @@ import {
   type Credentials,
   type PortForwardState,
   type PortForwardStatus,
-  type PortForwardTarget,
   type ResourceStatus,
 } from "./api";
 
@@ -27,10 +28,11 @@ const emptyStatus = (): ResourceStatus => ({
   name: "quickstart",
   exists: false,
   pods: [],
+  services: [],
 });
 
 const emptyPortForward = (
-  target: PortForwardTarget,
+  target: string,
   localPort: number,
   service: string,
 ): PortForwardState => ({
@@ -93,6 +95,15 @@ function badgeClassForStatus(status: ResourceStatus) {
   return "pending";
 }
 
+type ForwardRow = {
+  key: string;
+  source: string;
+  label: string;
+  command: string;
+  state: PortForwardState;
+  detail?: string;
+};
+
 export default function App() {
   const [cluster, setCluster] = useState<ClusterInfo | null>(null);
   const [namespace, setNamespace] = useState("default");
@@ -104,12 +115,15 @@ export default function App() {
   const [portForwards, setPortForwards] = useState<PortForwardStatus>({
     es: emptyPortForward("es", 9200, "quickstart-es-http"),
     kibana: emptyPortForward("kibana", 5601, "quickstart-kb-http"),
+    extras: [],
   });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [accessOpen, setAccessOpen] = useState(false);
+  const [managementOpen, setManagementOpen] = useState(false);
+  const [portForwardOpen, setPortForwardOpen] = useState(false);
   const [logstashModalOpen, setLogstashModalOpen] = useState(false);
   const [logstashConfig, setLogstashConfig] = useState(DEFAULT_LOGSTASH_CONFIG);
+  const [destroyModalOpen, setDestroyModalOpen] = useState(false);
 
   async function refreshPortForwards() {
     const status = await getPortForwards();
@@ -202,28 +216,68 @@ export default function App() {
   const deployedVersion = es.version || kb.version || ls.version || version;
   const hasInstances = es.exists || kb.exists || ls.exists;
 
+  const forwardRows: ForwardRow[] = [
+    {
+      key: "es",
+      source: "Elasticsearch",
+      label: "quickstart-es-http · 9200/TCP",
+      command:
+        creds?.portForwardEs ||
+        `kubectl -n ${namespace} port-forward service/quickstart-es-http 9200:9200`,
+      state: portForwards.es,
+    },
+    {
+      key: "kibana",
+      source: "Kibana",
+      label: "quickstart-kb-http · 5601/TCP",
+      command:
+        creds?.portForwardKibana ||
+        `kubectl -n ${namespace} port-forward service/quickstart-kb-http 5601:5601`,
+      state: portForwards.kibana,
+    },
+    ...(ls.services || []).flatMap((svc) =>
+      svc.ports.map((port) => {
+        const state =
+          findPortForwardState(portForwards, port.forwardTarget) ||
+          emptyPortForward(port.forwardTarget, port.port, svc.name);
+        return {
+          key: port.forwardTarget,
+          source: "Logstash",
+          label: `${svc.name} · ${port.name} · ${port.port}/${port.protocol}`,
+          detail:
+            `${svc.type}` +
+            (typeof port.nodePort === "number"
+              ? ` · NodePort ${port.nodePort}`
+              : ""),
+          command: port.command,
+          state,
+        };
+      }),
+    ),
+  ];
+
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="topbar-brand">ECKgui</div>
+        <div className="topbar-brand">
+          <img src="/eck-logo.png" alt="ECK" className="topbar-logo" />
+          <span>ECKgui</span>
+        </div>
         <div className="topbar-meta" title={cluster?.server}>
           {cluster?.context || "loading…"}
         </div>
       </header>
 
       <main className="page">
-        <p className="crumbs">
-          Elastic Cloud on Kubernetes / <span>quickstart</span>
-        </p>
-
         <section className="deploy-header">
           <div className="deploy-title">
             <h1>
-              quickstart
+              ECK quickstart management GUI
               <span className={`badge ${badge.className}`}>{badge.label}</span>
             </h1>
             <p className="subtitle">
-              Namespace {namespace} · Stack {deployedVersion} · ECK quickstart
+              Namespace {namespace} · Stack {deployedVersion} ·{" "}
+              {cluster?.context || "—"}
             </p>
           </div>
           <div className="header-actions">
@@ -233,34 +287,6 @@ export default function App() {
               onClick={() => run("refresh", async () => refreshAll())}
             >
               Refresh
-            </button>
-            <button
-              disabled={Boolean(busy) || !version}
-              onClick={() =>
-                run("es-deploy", async () => {
-                  await deployElasticsearch(namespace, version);
-                })
-              }
-            >
-              Deploy Elasticsearch
-            </button>
-            <button
-              disabled={Boolean(busy) || !es.exists || !version}
-              title={!es.exists ? "Deploy Elasticsearch first" : undefined}
-              onClick={() =>
-                run("kb-deploy", async () => {
-                  await deployKibana(namespace, version);
-                })
-              }
-            >
-              Deploy Kibana
-            </button>
-            <button
-              disabled={Boolean(busy) || !es.exists || !version}
-              title={!es.exists ? "Deploy Elasticsearch first" : undefined}
-              onClick={openLogstashModal}
-            >
-              Deploy Logstash
             </button>
             <button
               className="primary"
@@ -283,63 +309,123 @@ export default function App() {
         {error ? <p className="error">{error}</p> : null}
 
         <section className="panel">
-          <h2 className="panel-title">Summary</h2>
-          <div className="summary-grid">
-            <div className="summary-item">
-              <label>Deployment name</label>
-              <div className="value">quickstart</div>
-            </div>
-            <div className="summary-item">
-              <label htmlFor="namespace">Namespace</label>
-              <select
-                id="namespace"
-                value={namespace}
-                onChange={(e) => {
-                  const ns = e.target.value;
-                  setNamespace(ns);
-                  refreshAll(ns).catch((err) =>
-                    setError(err instanceof Error ? err.message : String(err)),
-                  );
-                }}
-              >
-                {(cluster?.namespaces || [namespace]).map((ns) => (
-                  <option key={ns} value={ns}>
-                    {ns}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="summary-item">
-              <label htmlFor="version">Deployment version</label>
-              <input
-                id="version"
-                value={version}
-                onChange={(e) => setVersion(e.target.value.trim())}
-                placeholder="9.5.0"
-                spellCheck={false}
-              />
-            </div>
-            <div className="summary-item">
-              <label>Kubernetes context</label>
-              <div className="value">{cluster?.context || "—"}</div>
-            </div>
-            <div className="summary-item">
-              <label>Template</label>
-              <div className="value">ECK quickstart</div>
-            </div>
-            <div className="summary-item">
-              <label>Components</label>
-              <div className="value">
-                {[
-                  es.exists ? "Elasticsearch" : null,
-                  kb.exists ? "Kibana" : null,
-                  ls.exists ? "Logstash" : null,
-                ]
-                  .filter(Boolean)
-                  .join(", ") || "none"}
+          <button
+            type="button"
+            className="panel-toggle"
+            aria-expanded={managementOpen}
+            onClick={() => setManagementOpen((open) => !open)}
+          >
+            <h2 className="panel-title">Management</h2>
+            <span className="chevron">{managementOpen ? "▾" : "▸"}</span>
+          </button>
+          {managementOpen ? (
+            <div className="panel-body">
+              <div className="summary-grid">
+                <div className="summary-item">
+                  <label>Deployment name</label>
+                  <div className="value">quickstart</div>
+                </div>
+                <div className="summary-item">
+                  <label htmlFor="namespace">Namespace</label>
+                  <select
+                    id="namespace"
+                    value={namespace}
+                    onChange={(e) => {
+                      const ns = e.target.value;
+                      setNamespace(ns);
+                      refreshAll(ns).catch((err) =>
+                        setError(
+                          err instanceof Error ? err.message : String(err),
+                        ),
+                      );
+                    }}
+                  >
+                    {(cluster?.namespaces || [namespace]).map((ns) => (
+                      <option key={ns} value={ns}>
+                        {ns}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="summary-item">
+                  <label htmlFor="version">Deployment version</label>
+                  <input
+                    id="version"
+                    value={version}
+                    onChange={(e) => setVersion(e.target.value.trim())}
+                    placeholder="9.5.0"
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="summary-item">
+                  <label>Kubernetes context</label>
+                  <div className="value">{cluster?.context || "—"}</div>
+                </div>
+                <div className="summary-item">
+                  <label>Template</label>
+                  <div className="value">ECK quickstart</div>
+                </div>
+                <div className="summary-item">
+                  <label>Components</label>
+                  <div className="value">
+                    {[
+                      es.exists ? "Elasticsearch" : null,
+                      kb.exists ? "Kibana" : null,
+                      ls.exists ? "Logstash" : null,
+                    ]
+                      .filter(Boolean)
+                      .join(", ") || "none"}
+                  </div>
+                </div>
+              </div>
+              <div className="deploy-actions">
+                <button
+                  disabled={Boolean(busy) || !version}
+                  onClick={() =>
+                    run("es-deploy", async () => {
+                      await deployElasticsearch(namespace, version);
+                    })
+                  }
+                >
+                  Deploy Elasticsearch
+                </button>
+                <button
+                  disabled={Boolean(busy) || !es.exists || !version}
+                  title={
+                    !es.exists ? "Deploy Elasticsearch first" : undefined
+                  }
+                  onClick={() =>
+                    run("kb-deploy", async () => {
+                      await deployKibana(namespace, version);
+                    })
+                  }
+                >
+                  Deploy Kibana
+                </button>
+                <button
+                  disabled={Boolean(busy) || !es.exists || !version}
+                  title={
+                    !es.exists ? "Deploy Elasticsearch first" : undefined
+                  }
+                  onClick={openLogstashModal}
+                >
+                  Deploy Logstash
+                </button>
+                <button
+                  className="danger"
+                  disabled={Boolean(busy) || !hasInstances}
+                  title={
+                    hasInstances
+                      ? `Delete Logstash, Kibana, and Elasticsearch in ${namespace}`
+                      : "Nothing to destroy in this namespace"
+                  }
+                  onClick={() => setDestroyModalOpen(true)}
+                >
+                  Destroy all
+                </button>
               </div>
             </div>
-          </div>
+          ) : null}
         </section>
 
         <div className="section-head">
@@ -350,8 +436,8 @@ export default function App() {
         {!hasInstances ? (
           <section className="panel">
             <p className="empty-status">
-              No quickstart instances in this namespace. Use Deploy Elasticsearch
-              to get started.
+              No quickstart instances in this namespace. Open Management and use
+              Deploy Elasticsearch to get started.
             </p>
           </section>
         ) : (
@@ -362,6 +448,7 @@ export default function App() {
                 status={es}
                 endpoint="https://localhost:9200"
                 portForwardRunning={portForwards.es.status === "running"}
+                credentials={creds}
                 busy={busy}
                 onRefresh={() => run("es-refresh", async () => refreshAll())}
                 onStop={() =>
@@ -403,67 +490,45 @@ export default function App() {
           </div>
         )}
 
-        <div className="access-section">
+        <section className="panel port-forward-panel">
           <button
             type="button"
-            className="access-toggle"
-            aria-expanded={accessOpen}
-            onClick={() => setAccessOpen((open) => !open)}
+            className="panel-toggle"
+            aria-expanded={portForwardOpen}
+            onClick={() => setPortForwardOpen((open) => !open)}
           >
-            <span>Access credentials & port-forward</span>
-            <span className="chevron">{accessOpen ? "▾" : "▸"}</span>
+            <h2 className="panel-title">Port-forward</h2>
+            <span className="chevron">{portForwardOpen ? "▾" : "▸"}</span>
           </button>
-          {accessOpen ? (
-            <div className="access-body">
-              <div className="meta">
-                <div>
-                  <span>user</span>
-                  <strong>{creds?.user || "elastic"}</strong>
-                </div>
-                <div>
-                  <span>password</span>
-                  <strong>
-                    {creds?.password || "(secret not available yet)"}
-                  </strong>
-                </div>
-              </div>
-
-              <PortForwardControls
-                label="Port-forward Elasticsearch"
-                command={creds?.portForwardEs || "—"}
-                state={portForwards.es}
-                busy={busy}
-                onStart={() =>
-                  runPortForward("pf-es-start", async () => {
-                    await startPortForward("es", namespace);
-                  })
-                }
-                onStop={() =>
-                  runPortForward("pf-es-stop", async () => {
-                    await stopPortForward("es");
-                  })
-                }
-              />
-
-              <PortForwardControls
-                label="Port-forward Kibana"
-                command={creds?.portForwardKibana || "—"}
-                state={portForwards.kibana}
-                busy={busy}
-                onStart={() =>
-                  runPortForward("pf-kb-start", async () => {
-                    await startPortForward("kibana", namespace);
-                  })
-                }
-                onStop={() =>
-                  runPortForward("pf-kb-stop", async () => {
-                    await stopPortForward("kibana");
-                  })
-                }
-              />
+          {portForwardOpen ? (
+            <div className="panel-body">
+              <p className="hint panel-hint">
+                Elasticsearch, Kibana, and discovered Logstash services.
+              </p>
+              {forwardRows.map((row) => (
+                <PortForwardControls
+                  key={row.key}
+                  source={row.source}
+                  label={row.label}
+                  detail={row.detail}
+                  command={row.command}
+                  state={row.state}
+                  busy={busy}
+                  onStart={() =>
+                    runPortForward(`pf-${row.key}-start`, async () => {
+                      await startPortForward(row.key, namespace);
+                    })
+                  }
+                  onStop={() =>
+                    runPortForward(`pf-${row.key}-stop`, async () => {
+                      await stopPortForward(row.key);
+                    })
+                  }
+                />
+              ))}
             </div>
           ) : null}
-        </div>
+        </section>
       </main>
 
       {logstashModalOpen ? (
@@ -523,19 +588,69 @@ export default function App() {
           </div>
         </div>
       ) : null}
+
+      {destroyModalOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !busy) setDestroyModalOpen(false);
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="destroy-modal-title"
+          >
+            <h2 id="destroy-modal-title">Destroy all resources?</h2>
+            <p className="hint">
+              This will permanently delete the <code>quickstart</code> Logstash,
+              Kibana, and Elasticsearch resources in namespace{" "}
+              <strong>{namespace}</strong>, and stop active port-forwards.
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={() => setDestroyModalOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                disabled={Boolean(busy)}
+                onClick={() =>
+                  run("destroy-all", async () => {
+                    await destroyQuickstart(namespace);
+                    setDestroyModalOpen(false);
+                  })
+                }
+              >
+                Confirm destroy
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
 
 function PortForwardControls({
+  source,
   label,
+  detail,
   command,
   state,
   busy,
   onStart,
   onStop,
 }: {
+  source: string;
   label: string;
+  detail?: string;
   command: string;
   state: PortForwardState;
   busy: string | null;
@@ -546,7 +661,11 @@ function PortForwardControls({
   return (
     <div className="pf-row">
       <div className="pf-header">
-        <label>{label}</label>
+        <div>
+          <div className="pf-source">{source}</div>
+          <label>{label}</label>
+          {detail ? <div className="pf-detail">{detail}</div> : null}
+        </div>
         <span className={`pf-status ${state.status}`}>
           {state.status}
           {state.pid ? ` · pid ${state.pid}` : ""}
@@ -579,6 +698,7 @@ function InstanceCard({
   status,
   endpoint,
   portForwardRunning,
+  credentials,
   busy,
   onRefresh,
   onStop,
@@ -588,11 +708,13 @@ function InstanceCard({
   status: ResourceStatus;
   endpoint?: string;
   portForwardRunning?: boolean;
+  credentials?: Credentials | null;
   busy: string | null;
   onRefresh: () => void;
   onStop: () => void;
   onEditConfig?: () => void;
 }) {
+  const [credsOpen, setCredsOpen] = useState(false);
   const health = status.health || status.phase || "pending";
   const canOpen = Boolean(endpoint && portForwardRunning);
   return (
@@ -611,16 +733,38 @@ function InstanceCard({
           <span>{status.nodes} nodes</span>
         ) : null}
       </div>
+      {credentials ? (
+        <div className="credentials-block">
+          <button
+            type="button"
+            className="credentials-toggle"
+            aria-expanded={credsOpen}
+            onClick={() => setCredsOpen((open) => !open)}
+          >
+            <span className="credentials-title">Access credentials</span>
+            <span className="chevron">{credsOpen ? "▾" : "▸"}</span>
+          </button>
+          {credsOpen ? (
+            <div className="meta">
+              <div>
+                <span>user</span>
+                <strong>{credentials.user || "elastic"}</strong>
+              </div>
+              <div>
+                <span>password</span>
+                <strong>
+                  {credentials.password || "(secret not available yet)"}
+                </strong>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       <div className="instance-actions">
         {endpoint ? (
           <button
             className="primary"
             disabled={!canOpen}
-            title={
-              canOpen
-                ? endpoint
-                : "Start the port-forward first (Access credentials & port-forward)"
-            }
             onClick={() => window.open(endpoint, "_blank", "noreferrer")}
           >
             Open
@@ -638,6 +782,12 @@ function InstanceCard({
           Stop
         </button>
       </div>
+      {endpoint && !canOpen ? (
+        <p className="open-hint">
+          Open needs an active port-forward. Start it in the Port-forward panel
+          below.
+        </p>
+      ) : null}
       <ul className="pods">
         {status.pods.length === 0 && <li>No pods</li>}
         {status.pods.map((pod) => (

@@ -20,6 +20,24 @@ export type PodInfo = {
   restarts: number;
 };
 
+export type ServicePortInfo = {
+  name: string;
+  port: number;
+  targetPort?: string | number;
+  nodePort?: number;
+  protocol: string;
+  /** Port-forward target key: svc:<service>:<port> */
+  forwardTarget: string;
+  command: string;
+};
+
+export type ServiceInfo = {
+  name: string;
+  type: string;
+  clusterIP?: string;
+  ports: ServicePortInfo[];
+};
+
 export type ResourceStatus = {
   name: string;
   exists: boolean;
@@ -30,6 +48,7 @@ export type ResourceStatus = {
   count?: number;
   pods: PodInfo[];
   configString?: string | null;
+  services?: ServiceInfo[];
 };
 
 type CustomApi = {
@@ -45,6 +64,10 @@ type CoreApi = {
     namespace: string;
     labelSelector?: string;
   }) => Promise<{ items?: k8s.V1Pod[] }>;
+  listNamespacedService: (p: {
+    namespace: string;
+    labelSelector?: string;
+  }) => Promise<{ items?: k8s.V1Service[] }>;
   readNamespacedSecret: (p: {
     name: string;
     namespace: string;
@@ -368,6 +391,13 @@ export async function deleteLogstash(namespace: string): Promise<void> {
   }
 }
 
+/** Delete Logstash, Kibana, then Elasticsearch (dependents first). */
+export async function destroyQuickstart(namespace: string): Promise<void> {
+  await deleteLogstash(namespace);
+  await deleteKibana(namespace);
+  await deleteElasticsearch(namespace);
+}
+
 export async function getElasticsearchStatus(
   namespace: string,
 ): Promise<ResourceStatus> {
@@ -461,11 +491,10 @@ export async function getLogstashStatus(
 
     const status = (obj.status ?? {}) as Record<string, unknown>;
     const spec = (obj.spec ?? {}) as Record<string, unknown>;
-    const pods = await listPods(
-      core,
-      namespace,
-      "logstash.k8s.elastic.co/name=quickstart",
-    );
+    const [pods, services] = await Promise.all([
+      listPods(core, namespace, "logstash.k8s.elastic.co/name=quickstart"),
+      listLogstashServices(core, namespace),
+    ]);
 
     const available =
       typeof status.availableNodes === "number"
@@ -501,6 +530,7 @@ export async function getLogstashStatus(
       nodes: available,
       configString: extractLogstashConfigString(spec),
       pods,
+      services,
     };
   } catch (err) {
     if (isNotFound(err)) {
@@ -509,6 +539,7 @@ export async function getLogstashStatus(
         exists: false,
         pods: [],
         configString: null,
+        services: [],
       };
     }
     throw err;
@@ -559,6 +590,48 @@ async function listPods(
     ready: podReady(pod),
     restarts: podRestarts(pod),
   }));
+}
+
+async function listLogstashServices(
+  core: CoreApi,
+  namespace: string,
+): Promise<ServiceInfo[]> {
+  const res = await core.listNamespacedService({
+    namespace,
+    labelSelector: "logstash.k8s.elastic.co/name=quickstart",
+  });
+
+  return (res.items ?? [])
+    .map((svc) => {
+      const name = svc.metadata?.name || "unknown";
+      const type = svc.spec?.type || "ClusterIP";
+      const ports = (svc.spec?.ports ?? [])
+        .filter((p): p is k8s.V1ServicePort & { port: number } => typeof p.port === "number")
+        .map((p) => {
+          const port = p.port;
+          return {
+            name: p.name || String(port),
+            port,
+            targetPort:
+              typeof p.targetPort === "object" && p.targetPort !== null
+                ? undefined
+                : (p.targetPort as string | number | undefined),
+            nodePort: typeof p.nodePort === "number" ? p.nodePort : undefined,
+            protocol: p.protocol || "TCP",
+            forwardTarget: `svc:${name}:${port}`,
+            command: `kubectl -n ${namespace} port-forward service/${name} ${port}:${port}`,
+          };
+        });
+
+      return {
+        name,
+        type,
+        clusterIP: svc.spec?.clusterIP,
+        ports,
+      };
+    })
+    .filter((svc) => svc.ports.length > 0)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function isAlreadyExists(err: unknown): boolean {
