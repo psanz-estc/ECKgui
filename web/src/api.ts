@@ -1,5 +1,6 @@
 export type ClusterInfo = {
   context: string;
+  contexts: string[];
   server: string;
   namespaces: string[];
   defaultVersion: string;
@@ -86,18 +87,56 @@ export function getCluster() {
   return request<ClusterInfo>("/api/cluster");
 }
 
+export function setClusterContext(context: string) {
+  return request<ClusterInfo>("/api/cluster/context", {
+    method: "POST",
+    body: JSON.stringify({ context }),
+  });
+}
+
+export function createNamespace(name: string) {
+  return request<ClusterInfo & { name: string }>("/api/namespaces", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteNamespace(name: string) {
+  return request<ClusterInfo & { ok: boolean; deleted: string }>(
+    `/api/namespaces/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+}
+
+export const PROTECTED_NAMESPACES = new Set([
+  "default",
+  "kube-system",
+  "kube-public",
+  "kube-node-lease",
+  "elastic-system",
+]);
+
 export function getElasticsearch(namespace: string) {
   return request<ResourceStatus>(
     `/api/elasticsearch?namespace=${encodeURIComponent(namespace)}`,
   );
 }
 
-export function deployElasticsearch(namespace: string, version: string) {
+export function deployElasticsearch(
+  namespace: string,
+  version: string,
+  options: { heapSize?: string; nodeCount?: number } = {},
+) {
+  const { heapSize, nodeCount } = options;
   return request<ResourceStatus>(
     `/api/elasticsearch?namespace=${encodeURIComponent(namespace)}`,
     {
       method: "POST",
-      body: JSON.stringify({ version }),
+      body: JSON.stringify({
+        version,
+        ...(heapSize?.trim() ? { heapSize: heapSize.trim() } : {}),
+        ...(typeof nodeCount === "number" ? { nodeCount } : {}),
+      }),
     },
   );
 }
@@ -162,6 +201,109 @@ export function deleteLogstash(namespace: string) {
 export function destroyQuickstart(namespace: string) {
   return request<{ ok: boolean }>(
     `/api/quickstart?namespace=${encodeURIComponent(namespace)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function deployAllQuickstart(
+  namespace: string,
+  version: string,
+  options: {
+    includeLogstash?: boolean;
+    configString?: string;
+    heapSize?: string;
+    nodeCount?: number;
+  } = {},
+) {
+  const { heapSize, nodeCount, ...rest } = options;
+  return request<{ ok: boolean }>(
+    `/api/quickstart/deploy-all?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        version,
+        ...rest,
+        ...(heapSize?.trim() ? { heapSize: heapSize.trim() } : {}),
+        ...(typeof nodeCount === "number" ? { nodeCount } : {}),
+      }),
+    },
+  );
+}
+
+export function getPodLogs(
+  namespace: string,
+  name: string,
+  tailLines = 200,
+) {
+  const params = new URLSearchParams({
+    namespace,
+    tailLines: String(tailLines),
+  });
+  return request<{
+    name: string;
+    namespace: string;
+    tailLines: number;
+    logs: string;
+  }>(`/api/pods/${encodeURIComponent(name)}/logs?${params.toString()}`);
+}
+
+export type FleetExampleMeta = {
+  id: string;
+  name: string;
+  description: string;
+  note?: string;
+};
+
+export function getFleetExamples() {
+  return request<{ examples: FleetExampleMeta[] }>("/api/fleet/examples");
+}
+
+export function deployFleetExample(
+  namespace: string,
+  version: string,
+  exampleId: string,
+) {
+  return request<{ ok: boolean; exampleId: string }>(
+    `/api/fleet/example?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ version, exampleId }),
+    },
+  );
+}
+
+export function getFleetServer(namespace: string) {
+  return request<ResourceStatus>(
+    `/api/fleet-server?namespace=${encodeURIComponent(namespace)}`,
+  );
+}
+
+export function deployFleetServer(namespace: string, version: string) {
+  return request<ResourceStatus>(
+    `/api/fleet-server?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ version }),
+    },
+  );
+}
+
+export function deleteFleetServer(namespace: string) {
+  return request<{ ok: boolean }>(
+    `/api/fleet-server?namespace=${encodeURIComponent(namespace)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function getElasticAgent(namespace: string) {
+  return request<ResourceStatus>(
+    `/api/elastic-agent?namespace=${encodeURIComponent(namespace)}`,
+  );
+}
+
+export function deleteElasticAgent(namespace: string) {
+  return request<{ ok: boolean }>(
+    `/api/elastic-agent?namespace=${encodeURIComponent(namespace)}`,
     { method: "DELETE" },
   );
 }

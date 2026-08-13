@@ -1,4 +1,9 @@
 import * as k8s from "@kubernetes/client-node";
+import {
+  listKubeContexts,
+  loadKubeConfig,
+  setActiveContext,
+} from "./kubeconfig.js";
 
 const ES_GROUP = "elasticsearch.k8s.elastic.co";
 const KB_GROUP = "kibana.k8s.elastic.co";
@@ -9,6 +14,7 @@ const RESOURCE_NAME = "quickstart";
 
 export type ClusterInfo = {
   context: string;
+  contexts: string[];
   server: string;
   namespaces: string[];
 };
@@ -60,6 +66,8 @@ type CustomApi = {
 
 type CoreApi = {
   listNamespace: () => Promise<{ items?: k8s.V1Namespace[] }>;
+  createNamespace: (p: { body: k8s.V1Namespace }) => Promise<k8s.V1Namespace>;
+  deleteNamespace: (p: { name: string }) => Promise<unknown>;
   listNamespacedPod: (p: {
     namespace: string;
     labelSelector?: string;
@@ -72,13 +80,32 @@ type CoreApi = {
     name: string;
     namespace: string;
   }) => Promise<k8s.V1Secret>;
+  readNamespacedPodLog: (p: {
+    name: string;
+    namespace: string;
+    tailLines?: number;
+    timestamps?: boolean;
+  }) => Promise<string>;
+  listNamespacedPersistentVolumeClaim: (p: {
+    namespace: string;
+  }) => Promise<{ items?: k8s.V1PersistentVolumeClaim[] }>;
+  deleteNamespacedPersistentVolumeClaim: (p: {
+    name: string;
+    namespace: string;
+  }) => Promise<unknown>;
 };
 
-function loadKubeConfig(): k8s.KubeConfig {
-  const kc = new k8s.KubeConfig();
-  kc.loadFromDefault();
-  return kc;
-}
+const HEAP_SIZE_RE = /^(\d+(?:\.\d+)?)([mMgG])$/;
+
+const PROTECTED_NAMESPACES = new Set([
+  "default",
+  "kube-system",
+  "kube-public",
+  "kube-node-lease",
+  "elastic-system",
+]);
+
+const NAMESPACE_NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 
 function clients() {
   const kc = loadKubeConfig();
@@ -106,6 +133,7 @@ function podRestarts(pod: k8s.V1Pod): number {
 export async function getClusterInfo(): Promise<ClusterInfo> {
   const { kc, core } = clients();
   const context = kc.getCurrentContext() || "unknown";
+  const contexts = listKubeContexts();
   const cluster = kc.getCurrentCluster();
   const nsList = await core.listNamespace();
   const namespaces = (nsList.items ?? [])
@@ -115,32 +143,160 @@ export async function getClusterInfo(): Promise<ClusterInfo> {
 
   return {
     context,
+    contexts: contexts.length > 0 ? contexts : [context],
     server: cluster?.server || "unknown",
     namespaces: namespaces.length > 0 ? namespaces : ["default"],
   };
 }
 
-function buildElasticsearchManifest(version: string, namespace: string) {
+export function switchKubeContext(context: string): string {
+  return setActiveContext(context);
+}
+
+function assertValidNamespaceName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length > 63 || !NAMESPACE_NAME_RE.test(trimmed)) {
+    const err = new Error(
+      "Invalid namespace name. Use lowercase DNS label (a-z, 0-9, -), max 63 chars.",
+    ) as Error & { statusCode: number };
+    err.statusCode = 400;
+    throw err;
+  }
+  return trimmed;
+}
+
+export function isProtectedNamespace(name: string): boolean {
+  return PROTECTED_NAMESPACES.has(name);
+}
+
+export async function createNamespace(name: string): Promise<string> {
+  const ns = assertValidNamespaceName(name);
+  const { core } = clients();
+  try {
+    await core.createNamespace({
+      body: {
+        apiVersion: "v1",
+        kind: "Namespace",
+        metadata: { name: ns },
+      },
+    });
+  } catch (err) {
+    if (isAlreadyExists(err)) {
+      return ns;
+    }
+    throw err;
+  }
+  return ns;
+}
+
+export async function deleteNamespace(name: string): Promise<void> {
+  const ns = assertValidNamespaceName(name);
+  if (isProtectedNamespace(ns)) {
+    const err = new Error(
+      `Namespace "${ns}" is protected and cannot be deleted from ECKgui.`,
+    ) as Error & { statusCode: number };
+    err.statusCode = 400;
+    throw err;
+  }
+  const { core } = clients();
+  try {
+    await core.deleteNamespace({ name: ns });
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+  }
+}
+
+export function normalizeHeapSize(heapSize?: string | null): string | undefined {
+  if (heapSize == null) return undefined;
+  const trimmed = heapSize.trim();
+  if (!trimmed) return undefined;
+  const match = HEAP_SIZE_RE.exec(trimmed);
+  if (!match) {
+    const err = new Error(
+      'Invalid heapSize. Use forms like "512m", "1g", or "2g".',
+    ) as Error & { statusCode: number };
+    err.statusCode = 400;
+    throw err;
+  }
+  return `${match[1]}${match[2].toLowerCase()}`;
+}
+
+/** Container memory ≈ 2× heap (heap ~50% of pod memory). */
+function memoryLimitForHeap(heap: string): string {
+  const match = HEAP_SIZE_RE.exec(heap);
+  if (!match) return "2Gi";
+  const value = Number(match[1]) * 2;
+  const unit = match[2].toLowerCase() === "m" ? "Mi" : "Gi";
+  return `${value % 1 === 0 ? value : value.toFixed(1)}${unit}`;
+}
+
+export function normalizeNodeCount(nodeCount?: number | null): number {
+  if (nodeCount == null || Number.isNaN(nodeCount)) return 1;
+  const n = Math.floor(Number(nodeCount));
+  if (!Number.isFinite(n) || n < 1 || n > 9) {
+    const err = new Error(
+      "nodeCount must be an integer between 1 and 9.",
+    ) as Error & { statusCode: number };
+    err.statusCode = 400;
+    throw err;
+  }
+  return n;
+}
+
+function buildElasticsearchManifest(
+  version: string,
+  namespace: string,
+  options: { heapSize?: string; nodeCount?: number } = {},
+) {
+  const nodeSet: Record<string, unknown> = {
+    name: "default",
+    count: normalizeNodeCount(options.nodeCount),
+    config: {
+      "node.store.allow_mmap": false,
+    },
+  };
+
+  const heap = normalizeHeapSize(options.heapSize);
+  if (heap) {
+    const memory = memoryLimitForHeap(heap);
+    nodeSet.podTemplate = {
+      spec: {
+        containers: [
+          {
+            name: "elasticsearch",
+            env: [
+              {
+                name: "ES_JAVA_OPTS",
+                value: `-Xms${heap} -Xmx${heap}`,
+              },
+            ],
+            resources: {
+              requests: { memory },
+              limits: { memory },
+            },
+          },
+        ],
+      },
+    };
+  }
+
   return {
     apiVersion: `${ES_GROUP}/${API_VERSION}`,
     kind: "Elasticsearch",
     metadata: { name: RESOURCE_NAME, namespace },
     spec: {
       version,
-      nodeSets: [
-        {
-          name: "default",
-          count: 1,
-          config: {
-            "node.store.allow_mmap": false,
-          },
-        },
-      ],
+      // Ensure PVC (and thus PV with Delete reclaim) go away with the cluster.
+      volumeClaimDeletePolicy: "DeleteOnScaledownAndClusterDeletion",
+      nodeSets: [nodeSet],
     },
   };
 }
 
 function buildKibanaManifest(version: string, namespace: string) {
+  // Seed Fleet's default ES output before Fleet Server exists. Otherwise
+  // Kibana initializes fleet-default-output as localhost:9200 and later
+  // xpack.fleet.agents.elasticsearch.hosts changes may not override it.
   return {
     apiVersion: `${KB_GROUP}/${API_VERSION}`,
     kind: "Kibana",
@@ -150,6 +306,11 @@ function buildKibanaManifest(version: string, namespace: string) {
       count: 1,
       elasticsearchRef: {
         name: RESOURCE_NAME,
+      },
+      config: {
+        "xpack.fleet.agents.elasticsearch.hosts": [
+          `https://${RESOURCE_NAME}-es-http.${namespace}.svc:9200`,
+        ],
       },
     },
   };
@@ -219,9 +380,10 @@ function extractLogstashConfigString(spec: Record<string, unknown>): string | nu
 export async function deployElasticsearch(
   namespace: string,
   version: string,
+  options: { heapSize?: string; nodeCount?: number } = {},
 ): Promise<void> {
   const { custom } = clients();
-  const body = buildElasticsearchManifest(version, namespace);
+  const body = buildElasticsearchManifest(version, namespace, options);
   try {
     await custom.createNamespacedCustomObject({
       group: ES_GROUP,
@@ -391,11 +553,42 @@ export async function deleteLogstash(namespace: string): Promise<void> {
   }
 }
 
-/** Delete Logstash, Kibana, then Elasticsearch (dependents first). */
+function isQuickstartPvc(pvc: k8s.V1PersistentVolumeClaim): boolean {
+  const name = pvc.metadata?.name || "";
+  const labels = pvc.metadata?.labels ?? {};
+  if (name.includes(RESOURCE_NAME)) return true;
+  if (labels["elasticsearch.k8s.elastic.co/cluster-name"] === RESOURCE_NAME) {
+    return true;
+  }
+  if (labels["logstash.k8s.elastic.co/name"] === RESOURCE_NAME) return true;
+  if (labels["kibana.k8s.elastic.co/name"] === RESOURCE_NAME) return true;
+  return false;
+}
+
+/** Best-effort delete of quickstart PVCs left after CR deletion. */
+export async function deleteQuickstartPvcs(namespace: string): Promise<void> {
+  const { core } = clients();
+  const res = await core.listNamespacedPersistentVolumeClaim({ namespace });
+  const pvcs = (res.items ?? []).filter(isQuickstartPvc);
+  await Promise.all(
+    pvcs.map(async (pvc) => {
+      const name = pvc.metadata?.name;
+      if (!name) return;
+      try {
+        await core.deleteNamespacedPersistentVolumeClaim({ name, namespace });
+      } catch (err) {
+        if (!isNotFound(err)) throw err;
+      }
+    }),
+  );
+}
+
+/** Delete Logstash, Kibana, then Elasticsearch (dependents first), then PVCs. */
 export async function destroyQuickstart(namespace: string): Promise<void> {
   await deleteLogstash(namespace);
   await deleteKibana(namespace);
   await deleteElasticsearch(namespace);
+  await deleteQuickstartPvcs(namespace);
 }
 
 export async function getElasticsearchStatus(
@@ -419,7 +612,7 @@ export async function getElasticsearchStatus(
       "elasticsearch.k8s.elastic.co/cluster-name=quickstart",
     );
 
-    return {
+    return withTerminatingHealth({
       name: RESOURCE_NAME,
       exists: true,
       version: String(spec.version ?? ""),
@@ -430,10 +623,18 @@ export async function getElasticsearchStatus(
           ? status.availableNodes
           : undefined,
       pods,
-    };
+    });
   } catch (err) {
     if (isNotFound(err)) {
-      return { name: RESOURCE_NAME, exists: false, pods: [] };
+      const terminating = await statusWhileTerminating(
+        core,
+        RESOURCE_NAME,
+        "elasticsearch.k8s.elastic.co/cluster-name=quickstart",
+        namespace,
+      );
+      return (
+        terminating ?? { name: RESOURCE_NAME, exists: false, pods: [] }
+      );
     }
     throw err;
   }
@@ -460,17 +661,25 @@ export async function getKibanaStatus(
       "kibana.k8s.elastic.co/name=quickstart",
     );
 
-    return {
+    return withTerminatingHealth({
       name: RESOURCE_NAME,
       exists: true,
       version: String(spec.version ?? ""),
       health: status.health ? String(status.health) : undefined,
       count: typeof spec.count === "number" ? spec.count : undefined,
       pods,
-    };
+    });
   } catch (err) {
     if (isNotFound(err)) {
-      return { name: RESOURCE_NAME, exists: false, pods: [] };
+      const terminating = await statusWhileTerminating(
+        core,
+        RESOURCE_NAME,
+        "kibana.k8s.elastic.co/name=quickstart",
+        namespace,
+      );
+      return (
+        terminating ?? { name: RESOURCE_NAME, exists: false, pods: [] }
+      );
     }
     throw err;
   }
@@ -521,7 +730,7 @@ export async function getLogstashStatus(
       health = "green";
     }
 
-    return {
+    return withTerminatingHealth({
       name: RESOURCE_NAME,
       exists: true,
       version: String(spec.version ?? ""),
@@ -531,16 +740,25 @@ export async function getLogstashStatus(
       configString: extractLogstashConfigString(spec),
       pods,
       services,
-    };
+    });
   } catch (err) {
     if (isNotFound(err)) {
-      return {
-        name: RESOURCE_NAME,
-        exists: false,
-        pods: [],
-        configString: null,
-        services: [],
-      };
+      const terminating = await statusWhileTerminating(
+        core,
+        RESOURCE_NAME,
+        "logstash.k8s.elastic.co/name=quickstart",
+        namespace,
+        { configString: null, services: [] },
+      );
+      return (
+        terminating ?? {
+          name: RESOURCE_NAME,
+          exists: false,
+          pods: [],
+          configString: null,
+          services: [],
+        }
+      );
     }
     throw err;
   }
@@ -575,6 +793,23 @@ export async function getCredentials(namespace: string): Promise<{
   };
 }
 
+function podPhase(pod: k8s.V1Pod): string {
+  if (pod.metadata?.deletionTimestamp) return "Terminating";
+  return pod.status?.phase || "Unknown";
+}
+
+function withTerminatingHealth(
+  status: ResourceStatus,
+): ResourceStatus {
+  if (
+    status.pods.length > 0 &&
+    status.pods.every((p) => p.phase === "Terminating")
+  ) {
+    return { ...status, health: "terminating", phase: "Terminating" };
+  }
+  return status;
+}
+
 async function listPods(
   core: CoreApi,
   namespace: string,
@@ -586,10 +821,41 @@ async function listPods(
   });
   return (res.items ?? []).map((pod) => ({
     name: pod.metadata?.name || "unknown",
-    phase: pod.status?.phase || "Unknown",
+    phase: podPhase(pod),
     ready: podReady(pod),
     restarts: podRestarts(pod),
   }));
+}
+
+/** Keep showing a resource while pods are still Terminating after the CR is gone. */
+async function statusWhileTerminating(
+  core: CoreApi,
+  name: string,
+  labelSelector: string,
+  namespace: string,
+  extras: Partial<ResourceStatus> = {},
+): Promise<ResourceStatus | null> {
+  const pods = await listPods(core, namespace, labelSelector);
+  if (pods.length === 0) return null;
+  return {
+    name,
+    exists: true,
+    health: "terminating",
+    phase: "Terminating",
+    pods,
+    ...extras,
+  };
+}
+
+/** Same as statusWhileTerminating, but loads the kube client itself (for fleet.ts). */
+export async function statusWhileTerminatingPods(
+  name: string,
+  labelSelector: string,
+  namespace: string,
+  extras: Partial<ResourceStatus> = {},
+): Promise<ResourceStatus | null> {
+  const { core } = clients();
+  return statusWhileTerminating(core, name, labelSelector, namespace, extras);
 }
 
 async function listLogstashServices(
@@ -674,4 +940,49 @@ export function getErrorMessage(err: unknown): string {
     );
   }
   return String(err);
+}
+
+export async function getPodLogs(
+  namespace: string,
+  name: string,
+  tailLines = 200,
+): Promise<{
+  name: string;
+  namespace: string;
+  tailLines: number;
+  logs: string;
+}> {
+  const trimmedName = name.trim();
+  if (!trimmedName) {
+    const err = new Error("pod name is required") as Error & {
+      statusCode: number;
+    };
+    err.statusCode = 400;
+    throw err;
+  }
+  const lines = Math.min(5000, Math.max(1, Math.floor(tailLines) || 200));
+  const { core } = clients();
+  try {
+    const logs = await core.readNamespacedPodLog({
+      name: trimmedName,
+      namespace,
+      tailLines: lines,
+      timestamps: true,
+    });
+    return {
+      name: trimmedName,
+      namespace,
+      tailLines: lines,
+      logs: typeof logs === "string" ? logs : String(logs ?? ""),
+    };
+  } catch (err) {
+    if (isNotFound(err)) {
+      const notFound = new Error(
+        `Pod "${trimmedName}" not found in namespace "${namespace}".`,
+      ) as Error & { statusCode: number };
+      notFound.statusCode = 404;
+      throw notFound;
+    }
+    throw err;
+  }
 }

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { kubectlContextArgs } from "./kubeconfig.js";
 
 export type BuiltinPortForwardTarget = "es" | "kibana";
 
@@ -132,6 +133,7 @@ export async function startPortForward(
 
   const cfg = resolveTarget(key);
   const args = [
+    ...kubectlContextArgs(),
     "-n",
     namespace,
     "port-forward",

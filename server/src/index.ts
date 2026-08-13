@@ -1,9 +1,23 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import {
+  assertFleetExampleId,
+  deleteElasticAgent,
+  deleteFleetResources,
+  deleteFleetServer,
+  deployAllQuickstart,
+  deployFleetPack,
+  deployFleetServer,
+  getElasticAgentStatus,
+  getFleetServerStatus,
+  listFleetExamples,
+} from "./fleet.js";
+import {
+  createNamespace,
   deleteElasticsearch,
   deleteKibana,
   deleteLogstash,
+  deleteNamespace,
   destroyQuickstart,
   deployElasticsearch,
   deployKibana,
@@ -14,6 +28,10 @@ import {
   getErrorMessage,
   getKibanaStatus,
   getLogstashStatus,
+  getPodLogs,
+  normalizeHeapSize,
+  normalizeNodeCount,
+  switchKubeContext,
 } from "./k8s.js";
 import {
   getPortForwardStatus,
@@ -22,6 +40,18 @@ import {
   stopAllPortForwards,
   stopPortForward,
 } from "./portforward.js";
+
+function statusFromError(err: unknown): number {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "statusCode" in err &&
+    typeof (err as { statusCode: unknown }).statusCode === "number"
+  ) {
+    return (err as { statusCode: number }).statusCode;
+  }
+  return 500;
+}
 
 const DEFAULT_VERSION = "9.5.0";
 const PORT = Number(process.env.PORT || 8787);
@@ -74,6 +104,38 @@ function namespaceFromQuery(query: Record<string, unknown>): string {
   return ns;
 }
 
+function heapSizeFromBody(body: unknown): string | undefined {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    "heapSize" in body &&
+    typeof (body as { heapSize: unknown }).heapSize === "string"
+  ) {
+    return normalizeHeapSize((body as { heapSize: string }).heapSize);
+  }
+  return undefined;
+}
+
+function nodeCountFromBody(body: unknown): number | undefined {
+  if (typeof body !== "object" || body === null || !("nodeCount" in body)) {
+    return undefined;
+  }
+  const raw = (body as { nodeCount: unknown }).nodeCount;
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  return normalizeNodeCount(n);
+}
+
+function tailLinesFromQuery(query: Record<string, unknown>): number {
+  const raw = query.tailLines;
+  if (typeof raw === "string" && raw.trim()) {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return n;
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  return 200;
+}
+
 app.get("/api/health", async () => ({ ok: true }));
 
 app.get("/api/cluster", async (_req, reply) => {
@@ -82,6 +144,48 @@ app.get("/api/cluster", async (_req, reply) => {
     return { ...info, defaultVersion: DEFAULT_VERSION };
   } catch (err) {
     reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/cluster/context", async (req, reply) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const context =
+      typeof body.context === "string" ? body.context : "";
+    switchKubeContext(context);
+    await stopAllPortForwards();
+    const info = await getClusterInfo();
+    return { ...info, defaultVersion: DEFAULT_VERSION };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/namespaces", async (req, reply) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const name =
+      typeof body.name === "string" ? body.name : "";
+    const created = await createNamespace(name);
+    const info = await getClusterInfo();
+    return { name: created, ...info, defaultVersion: DEFAULT_VERSION };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/namespaces/:name", async (req, reply) => {
+  try {
+    const name = decodeURIComponent((req.params as { name: string }).name);
+    await deleteNamespace(name);
+    await stopAllPortForwards();
+    const info = await getClusterInfo();
+    return { ok: true, deleted: name, ...info, defaultVersion: DEFAULT_VERSION };
+  } catch (err) {
+    reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
   }
 });
@@ -100,10 +204,24 @@ app.post("/api/elasticsearch", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
     const version = versionFromBody(req.body);
-    await deployElasticsearch(namespace, version);
+    const heapSize = heapSizeFromBody(req.body);
+    const nodeCount = nodeCountFromBody(req.body);
+    await deployElasticsearch(namespace, version, { heapSize, nodeCount });
     return await getElasticsearchStatus(namespace);
   } catch (err) {
-    reply.code(500);
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/pods/:name/logs", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const name = decodeURIComponent((req.params as { name: string }).name);
+    const tailLines = tailLinesFromQuery(req.query as Record<string, unknown>);
+    return await getPodLogs(namespace, name, tailLines);
+  } catch (err) {
+    reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
   }
 });
@@ -206,8 +324,117 @@ app.delete("/api/logstash", async (req, reply) => {
 app.delete("/api/quickstart", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await deleteFleetResources(namespace);
     await destroyQuickstart(namespace);
     await stopAllPortForwards();
+    return { ok: true };
+  } catch (err) {
+    reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/quickstart/deploy-all", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const version = versionFromBody(body);
+    const includeLogstash =
+      typeof body.includeLogstash === "boolean" ? body.includeLogstash : true;
+    const configString =
+      typeof body.configString === "string" ? body.configString : undefined;
+    const heapSize = heapSizeFromBody(body);
+    const nodeCount = nodeCountFromBody(body);
+    await deployAllQuickstart(namespace, version, {
+      includeLogstash,
+      configString,
+      heapSize,
+      nodeCount,
+    });
+    return { ok: true };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/fleet/examples", async (_req, reply) => {
+  try {
+    return { examples: listFleetExamples() };
+  } catch (err) {
+    reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/fleet/example", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const version = versionFromBody(body);
+    const exampleId = assertFleetExampleId(
+      typeof body.exampleId === "string" ? body.exampleId : "",
+    );
+    await deployFleetPack(namespace, version, exampleId);
+    return {
+      ok: true,
+      exampleId,
+      fleetServer: await getFleetServerStatus(namespace),
+      elasticAgent: await getElasticAgentStatus(namespace),
+    };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/fleet-server", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await getFleetServerStatus(namespace);
+  } catch (err) {
+    reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/fleet-server", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const version = versionFromBody(req.body);
+    await deployFleetServer(namespace, version);
+    return await getFleetServerStatus(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/fleet-server", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await deleteFleetServer(namespace);
+    return { ok: true };
+  } catch (err) {
+    reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/elastic-agent", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await getElasticAgentStatus(namespace);
+  } catch (err) {
+    reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/elastic-agent", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await deleteElasticAgent(namespace);
     return { ok: true };
   } catch (err) {
     reply.code(500);

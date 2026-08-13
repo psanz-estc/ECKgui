@@ -1,0 +1,36 @@
+---
+description: Smoke-test the ECK/ELK quickstart cluster from Cursor (kubectl + ES/Kibana HTTP)
+alwaysApply: true
+---
+
+# Cluster smoke testing (ECKgui)
+
+When the user asks to **test the cluster**, **smoke test**, **verify ELK/ECK**, or **check if the stack is healthy**, run this and report the summary (do not invent results):
+
+```bash
+npm run test:cluster
+```
+
+Optional env:
+
+- `NAMESPACE` (default `default`)
+- `KUBE_CONTEXT` (override kube context)
+- `SKIP_HTTP=1` (CR/pod checks only; no port-forward)
+
+## Agent workflow
+
+1. Prefer `npm run test:cluster` over ad-hoc kubectl/curl unless debugging a specific failure.
+2. Ensure `kubectl` works against the intended context (`kubectl config current-context`).
+3. If ES/KB HTTP fails, check pods/`Terminating`, then secrets `quickstart-es-elastic-user`.
+4. ECKgui API (`http://127.0.0.1:8787`) is optional — start with `npm run dev` only if needed.
+5. For interactive access after a green smoke test:
+   - ES: port-forward `svc/quickstart-es-http 9200:9200` → `https://localhost:9200`
+   - Kibana: port-forward `svc/quickstart-kb-http 5601:5601` → `https://localhost:5601`
+   - Password: `kubectl -n "$NAMESPACE" get secret quickstart-es-elastic-user -o jsonpath='{.data.elastic}' | base64 -d`
+
+## Pass criteria
+
+- Elasticsearch CR exists; ES health green or yellow over HTTPS
+- Relevant pods Running (warnings OK for Pending/Terminating)
+- Kibana `/api/status` 200 when Kibana is deployed
+- Exit code 0 from `npm run test:cluster`

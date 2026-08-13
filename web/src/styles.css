@@ -248,6 +248,61 @@ button:disabled {
   margin-top: 1rem;
   padding-top: 0.85rem;
   border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  align-items: center;
+}
+
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox-inline input {
+  margin: 0;
+}
+
+.fleet-examples {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.subsection-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.subsection-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.fleet-examples-body {
+  margin-top: 0.65rem;
+}
+
+.example-desc {
+  margin: 0.55rem 0 0;
+}
+
+.mono-value {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  word-break: break-all;
 }
 
 .credentials-block {
@@ -280,17 +335,26 @@ button:disabled {
 }
 
 .credentials-block .meta {
+  display: grid;
+  gap: 0.35rem;
   margin: 0.55rem 0 0;
+  font-family: var(--mono);
+  font-size: 0.85rem;
 }
 
-.open-hint {
-  margin: 0 0 0.75rem;
-  padding: 0.55rem 0.65rem;
-  font-size: 0.85rem;
-  line-height: 1.35;
-  color: #ffe2a8;
-  background: color-mix(in srgb, var(--warn) 14%, transparent);
-  border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--line));
+.credentials-block .meta div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  color: var(--muted);
+}
+
+.credentials-block .meta strong {
+  color: var(--text);
+  font-weight: 500;
+  word-break: break-all;
+  text-align: right;
 }
 
 .pf-source {
@@ -316,6 +380,23 @@ button:disabled {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 0.85rem 1.25rem;
+}
+
+.summary-item-wide {
+  grid-column: span 2;
+}
+
+.namespace-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.namespace-row select,
+.namespace-row input {
+  flex: 1 1 10rem;
+  min-width: 0;
 }
 
 .summary-item label {
@@ -544,10 +625,23 @@ button:disabled {
 
 .pods li {
   display: grid;
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: 1fr auto auto auto auto;
   gap: 0.55rem;
+  align-items: center;
   padding: 0.3rem 0;
   border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.pods .pod-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.pod-logs-btn {
+  padding: 0.2rem 0.45rem;
+  font-size: 0.72rem;
 }
 
 .empty-status {
@@ -728,9 +822,62 @@ button:disabled {
   margin-top: 0.85rem;
 }
 
+.logs-modal {
+  width: min(960px, 100%);
+  max-height: min(92vh, 900px);
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.55rem;
+  margin-bottom: 0.75rem;
+}
+
+.logs-controls label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.logs-controls input {
+  width: 6.5rem;
+  background: var(--bg0);
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 0.4rem 0.5rem;
+}
+
+.logs-output {
+  flex: 1;
+  margin: 0;
+  min-height: 280px;
+  max-height: min(60vh, 560px);
+  overflow: auto;
+  padding: 0.75rem;
+  background: var(--bg0);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #c9d7e8;
+}
+
 @media (max-width: 860px) {
   .summary-grid,
   .instance-grid {
     grid-template-columns: 1fr;
+  }
+
+  .summary-item-wide {
+    grid-column: span 1;
   }
 }
