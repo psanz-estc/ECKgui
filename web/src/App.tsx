@@ -1,5 +1,20 @@
 import { useEffect, useState } from "react";
 import {
+  EuiBadge,
+  EuiButton,
+  EuiButtonEmpty,
+  EuiCallOut,
+  EuiHeader,
+  EuiHeaderLogo,
+  EuiHeaderSection,
+  EuiHeaderSectionItem,
+  EuiHeaderSectionItemButton,
+  EuiPageTemplate,
+  EuiSpacer,
+  EuiText,
+  type EuiBadgeProps,
+} from "@elastic/eui";
+import {
   DEFAULT_LOGSTASH_CONFIG,
   PROTECTED_NAMESPACES,
   createNamespace,
@@ -16,9 +31,9 @@ import {
   deployFleetServer,
   deployKibana,
   deployLogstash,
-  findPortForwardState,
   getCluster,
   getCredentials,
+  getEckLicense,
   getElasticAgent,
   getElasticsearch,
   getFleetExamples,
@@ -28,10 +43,13 @@ import {
   getPodLogs,
   getPortForwards,
   setClusterContext,
+  startEckTrialLicense,
   startPortForward,
-  stopPortForward,
+  // findPortForwardState,
+  // stopPortForward,
   type ClusterInfo,
   type Credentials,
+  type EckLicenseStatus,
   type FleetExampleMeta,
   type PortForwardState,
   type PortForwardStatus,
@@ -104,6 +122,16 @@ function overallBadge(...statuses: ResourceStatus[]) {
   return { label: "Pending", className: "pending" };
 }
 
+function euiBadgeColor(
+  className: string,
+): EuiBadgeProps["color"] {
+  if (className === "healthy") return "success";
+  if (className === "unhealthy") return "danger";
+  if (className === "pending") return "warning";
+  if (className === "missing") return "hollow";
+  return "default";
+}
+
 function healthClass(status: ResourceStatus) {
   const h = (status.health || "").toLowerCase();
   if (h === "green") return "green";
@@ -123,6 +151,25 @@ function badgeClassForStatus(status: ResourceStatus) {
   return "pending";
 }
 
+function k8sStatusBadge(cluster: ClusterInfo | null): {
+  label: string;
+  className: string;
+} {
+  if (!cluster) {
+    return { label: "Checking…", className: "pending" };
+  }
+  if (!cluster.reachable) {
+    return { label: "Unreachable", className: "unhealthy" };
+  }
+  if (!cluster.eckInstalled) {
+    return { label: "No ECK", className: "pending" };
+  }
+  return { label: "Connected", className: "healthy" };
+}
+
+type StackTarget = "es" | "kb" | "ls" | "fleet" | "agent" | "all";
+
+/* Kept for Port-forward panel restore:
 type ForwardRow = {
   key: string;
   source: string;
@@ -131,6 +178,7 @@ type ForwardRow = {
   state: PortForwardState;
   detail?: string;
 };
+*/
 
 export default function App() {
   const [cluster, setCluster] = useState<ClusterInfo | null>(null);
@@ -143,6 +191,8 @@ export default function App() {
   const [elasticAgent, setElasticAgent] =
     useState<ResourceStatus>(emptyStatus());
   const [creds, setCreds] = useState<Credentials | null>(null);
+  const [eckLicense, setEckLicense] = useState<EckLicenseStatus | null>(null);
+  const [trialModalOpen, setTrialModalOpen] = useState(false);
   const [portForwards, setPortForwards] = useState<PortForwardStatus>({
     es: emptyPortForward("es", 9200, "quickstart-es-http"),
     kibana: emptyPortForward("kibana", 5601, "quickstart-kb-http"),
@@ -152,8 +202,9 @@ export default function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [k8sOpen, setK8sOpen] = useState(false);
   const [stackOpen, setStackOpen] = useState(false);
-  const [fleetExamplesOpen, setFleetExamplesOpen] = useState(false);
-  const [portForwardOpen, setPortForwardOpen] = useState(false);
+  const [stackTarget, setStackTarget] = useState<StackTarget | null>(null);
+  // const [fleetExamplesOpen, setFleetExamplesOpen] = useState(false);
+  // const [portForwardOpen, setPortForwardOpen] = useState(false);
   const [logstashModalOpen, setLogstashModalOpen] = useState(false);
   const [logstashConfig, setLogstashConfig] = useState(DEFAULT_LOGSTASH_CONFIG);
   const [destroyModalOpen, setDestroyModalOpen] = useState(false);
@@ -161,6 +212,7 @@ export default function App() {
   const [newNamespace, setNewNamespace] = useState("");
   const [includeLogstash, setIncludeLogstash] = useState(true);
   const [heapSize, setHeapSize] = useState("");
+  const [lsHeapSize, setLsHeapSize] = useState("");
   const [nodeCount, setNodeCount] = useState(1);
   const [fleetExamples, setFleetExamples] = useState<FleetExampleMeta[]>([]);
   const [selectedExample, setSelectedExample] = useState("quickstart");
@@ -177,6 +229,12 @@ export default function App() {
     setPortForwards(status);
   }
 
+  async function refreshCluster() {
+    const info = await getCluster();
+    setCluster(info);
+    return info;
+  }
+
   async function refreshAll(ns = namespace) {
     const [
       esStatus,
@@ -186,6 +244,7 @@ export default function App() {
       eaStatus,
       credentials,
       pfStatus,
+      license,
     ] = await Promise.all([
       getElasticsearch(ns),
       getKibana(ns),
@@ -194,6 +253,7 @@ export default function App() {
       getElasticAgent(ns),
       getCredentials(ns),
       getPortForwards(),
+      getEckLicense().catch(() => null),
     ]);
     setEs(esStatus);
     setKb(kbStatus);
@@ -202,6 +262,7 @@ export default function App() {
     setElasticAgent(eaStatus);
     setCreds(credentials);
     setPortForwards(pfStatus);
+    setEckLicense(license);
   }
 
   useEffect(() => {
@@ -337,7 +398,13 @@ export default function App() {
   const selectedExampleMeta = fleetExamples.find(
     (e) => e.id === selectedExample,
   );
+  const k8sBadge = k8sStatusBadge(cluster);
 
+  function toggleStackTarget(target: StackTarget) {
+    setStackTarget((current) => (current === target ? null : target));
+  }
+
+  /* Port-forward panel rows (kept for possible restore):
   const forwardRows: ForwardRow[] = [
     {
       key: "es",
@@ -366,54 +433,83 @@ export default function App() {
           key: port.forwardTarget,
           source: "Logstash",
           label: `${svc.name} · ${port.name} · ${port.port}/${port.protocol}`,
-          detail:
-            `${svc.type}` +
-            (typeof port.nodePort === "number"
-              ? ` · NodePort ${port.nodePort}`
-              : ""),
+          detail: undefined as string | undefined,
           command: port.command,
           state,
         };
       }),
     ),
   ];
+  */
 
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="topbar-brand">
-          <img src="/eck-logo.png" alt="ECK" className="topbar-logo" />
-          <span>ECKgui</span>
-        </div>
-        <div className="topbar-meta" title={cluster?.server}>
-          {cluster?.context || "loading…"}
-        </div>
-      </header>
+    <>
+      <EuiHeader position="fixed">
+        <EuiHeaderSection grow={false}>
+          <EuiHeaderSectionItem>
+            <EuiHeaderLogo
+              iconType="logoElastic"
+              href="/"
+              onClick={(e) => e.preventDefault()}
+              aria-label="ECKgui"
+            >
+              ECKgui
+            </EuiHeaderLogo>
+          </EuiHeaderSectionItem>
+        </EuiHeaderSection>
+        <EuiHeaderSection side="right">
+          <EuiHeaderSectionItem>
+            <EuiHeaderSectionItemButton
+              title={cluster?.server || undefined}
+              aria-label="Kubernetes context"
+            >
+              <EuiText size="xs" color="subdued">
+                <span className="eui-textInheritColor mono-value">
+                  {cluster?.context || "loading…"}
+                </span>
+              </EuiText>
+            </EuiHeaderSectionItemButton>
+          </EuiHeaderSectionItem>
+        </EuiHeaderSection>
+      </EuiHeader>
 
-      <main className="page">
-        <section className="deploy-header">
-          <div className="deploy-title">
-            <h1>
-              ECK quickstart management GUI
-              <span className={`badge ${badge.className}`}>{badge.label}</span>
-            </h1>
-            <p className="subtitle">
-              Namespace {namespace} · Stack {deployedVersion} ·{" "}
-              {cluster?.context || "—"}
-            </p>
-          </div>
-          <div className="header-actions">
-            <button
-              className="ghost"
-              disabled={Boolean(busy)}
-              onClick={() => run("refresh", async () => refreshAll())}
+      <EuiPageTemplate
+        offset={48}
+        paddingSize="l"
+        restrictWidth={1100}
+        grow={false}
+        className="eckgui-page"
+      >
+        <EuiPageTemplate.Header
+          pageTitle={
+            <>
+              ECK quickstart management GUI{" "}
+              <EuiBadge color={euiBadgeColor(badge.className)}>
+                {badge.label}
+              </EuiBadge>
+            </>
+          }
+          description={`Namespace ${namespace} · Stack ${deployedVersion} · ${
+            cluster?.context || "—"
+          }`}
+          rightSideItems={[
+            <EuiButtonEmpty
+              key="refresh"
+              iconType="refresh"
+              isDisabled={Boolean(busy)}
+              onClick={() =>
+                run("refresh", async () => {
+                  await refreshCluster();
+                })
+              }
             >
               Refresh
-            </button>
-            <button
-              className="primary"
-              type="button"
-              disabled={portForwards.kibana.status !== "running"}
+            </EuiButtonEmpty>,
+            <EuiButton
+              key="kibana"
+              fill
+              iconType="popout"
+              isDisabled={portForwards.kibana.status !== "running"}
               title={
                 portForwards.kibana.status !== "running"
                   ? "Start the Kibana port-forward first"
@@ -424,11 +520,19 @@ export default function App() {
               }
             >
               Open Kibana
-            </button>
-          </div>
-        </section>
+            </EuiButton>,
+          ]}
+        />
 
-        {error ? <p className="error">{error}</p> : null}
+        <EuiPageTemplate.Section>
+          {error ? (
+            <>
+              <EuiCallOut title="Error" color="danger" iconType="warning">
+                <p>{error}</p>
+              </EuiCallOut>
+              <EuiSpacer size="m" />
+            </>
+          ) : null}
 
         <section className="panel">
           <button
@@ -437,7 +541,15 @@ export default function App() {
             aria-expanded={k8sOpen}
             onClick={() => setK8sOpen((open) => !open)}
           >
-            <h2 className="panel-title">Kubernetes</h2>
+            <h2 className="panel-title">
+              Kubernetes
+              <span
+                className={`badge k8s-status-badge ${k8sBadge.className}`}
+                title={cluster?.error || cluster?.server || undefined}
+              >
+                {k8sBadge.label}
+              </span>
+            </h2>
             <span className="chevron">{k8sOpen ? "▾" : "▸"}</span>
           </button>
           {k8sOpen ? (
@@ -542,6 +654,41 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+                <div className="summary-item summary-item-wide">
+                  <label>ECK license</label>
+                  <div className="namespace-row">
+                    <div className="value">
+                      {eckLicense?.level
+                        ? eckLicense.level
+                        : cluster?.eckInstalled
+                          ? "loading…"
+                          : "n/a"}
+                      {eckLicense?.message ? (
+                        <span className="hint"> — {eckLicense.message}</span>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={
+                        Boolean(busy) ||
+                        !cluster?.eckInstalled ||
+                        !eckLicense?.canStartTrial
+                      }
+                      title={
+                        !cluster?.eckInstalled
+                          ? "ECK operator not detected"
+                          : !eckLicense?.canStartTrial
+                            ? eckLicense?.message ||
+                              "Trial unavailable for this cluster"
+                            : "Start a 30-day Enterprise trial (accepts Elastic EULA)"
+                      }
+                      onClick={() => setTrialModalOpen(true)}
+                    >
+                      Start Enterprise trial
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           ) : null}
@@ -574,128 +721,353 @@ export default function App() {
                     spellCheck={false}
                   />
                 </div>
-                <div className="summary-item">
-                  <label htmlFor="heap-size">ES heap</label>
-                  <input
-                    id="heap-size"
-                    value={heapSize}
-                    onChange={(e) => setHeapSize(e.target.value.trim())}
-                    placeholder="2g"
-                    spellCheck={false}
-                    title="Optional JVM heap at deploy time (e.g. 512m, 1g, 2g). Pod memory is set to 2× heap."
-                  />
+              </div>
+
+              <div className="stack-targets">
+                <div className="stack-target">
+                  <button
+                    type="button"
+                    className="subsection-toggle"
+                    aria-expanded={stackTarget === "es"}
+                    onClick={() => toggleStackTarget("es")}
+                  >
+                    <h3 className="subsection-title">Elasticsearch</h3>
+                    <span className="chevron">
+                      {stackTarget === "es" ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {stackTarget === "es" ? (
+                    <div className="stack-target-body">
+                      <div className="summary-grid">
+                        <div className="summary-item">
+                          <label htmlFor="heap-size">ES heap</label>
+                          <input
+                            id="heap-size"
+                            value={heapSize}
+                            onChange={(e) => setHeapSize(e.target.value.trim())}
+                            placeholder="2g"
+                            spellCheck={false}
+                            title="Optional JVM heap (e.g. 512m, 1g, 2g). Pod memory is 2× heap."
+                          />
+                        </div>
+                        <div className="summary-item">
+                          <label htmlFor="node-count">ES nodes</label>
+                          <input
+                            id="node-count"
+                            type="number"
+                            min={1}
+                            max={9}
+                            value={nodeCount}
+                            onChange={(e) => {
+                              const n = Number(e.target.value);
+                              if (Number.isFinite(n)) setNodeCount(n);
+                            }}
+                            title="nodeSets count (1–9)"
+                          />
+                        </div>
+                      </div>
+                      <div className="deploy-actions">
+                        <button
+                          className="primary"
+                          disabled={Boolean(busy) || !version}
+                          onClick={() =>
+                            run("es-deploy", async () => {
+                              await deployElasticsearch(namespace, version, {
+                                heapSize: heapSize || undefined,
+                                nodeCount,
+                              });
+                            })
+                          }
+                        >
+                          Deploy
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
-                <div className="summary-item">
-                  <label htmlFor="node-count">ES nodes</label>
-                  <input
-                    id="node-count"
-                    type="number"
-                    min={1}
-                    max={9}
-                    value={nodeCount}
-                    onChange={(e) => {
-                      const n = Number(e.target.value);
-                      if (Number.isFinite(n)) setNodeCount(n);
+
+                <div className="stack-target">
+                  <button
+                    type="button"
+                    className="subsection-toggle"
+                    aria-expanded={stackTarget === "kb"}
+                    onClick={() => toggleStackTarget("kb")}
+                  >
+                    <h3 className="subsection-title">Kibana</h3>
+                    <span className="chevron">
+                      {stackTarget === "kb" ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {stackTarget === "kb" ? (
+                    <div className="stack-target-body">
+                      <p className="hint panel-hint">
+                        Deploys Kibana named quickstart against Elasticsearch.
+                      </p>
+                      <div className="deploy-actions">
+                        <button
+                          className="primary"
+                          disabled={Boolean(busy) || !es.exists || !version}
+                          title={
+                            !es.exists ? "Deploy Elasticsearch first" : undefined
+                          }
+                          onClick={() =>
+                            run("kb-deploy", async () => {
+                              await deployKibana(namespace, version);
+                            })
+                          }
+                        >
+                          Deploy
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="stack-target">
+                  <button
+                    type="button"
+                    className="subsection-toggle"
+                    aria-expanded={stackTarget === "ls"}
+                    onClick={() => {
+                      if (stackTarget !== "ls") {
+                        setLogstashConfig(
+                          ls.configString?.trim() || DEFAULT_LOGSTASH_CONFIG,
+                        );
+                      }
+                      toggleStackTarget("ls");
                     }}
-                    title="nodeSets count (1–9). Needs cluster capacity; odd counts are typical for production quorum."
-                  />
+                  >
+                    <h3 className="subsection-title">Logstash</h3>
+                    <span className="chevron">
+                      {stackTarget === "ls" ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {stackTarget === "ls" ? (
+                    <div className="stack-target-body">
+                      <div className="summary-grid">
+                        <div className="summary-item">
+                          <label htmlFor="ls-heap-size">LS heap</label>
+                          <input
+                            id="ls-heap-size"
+                            value={lsHeapSize}
+                            onChange={(e) =>
+                              setLsHeapSize(e.target.value.trim())
+                            }
+                            placeholder="1g"
+                            spellCheck={false}
+                            title="Optional JVM heap (e.g. 512m, 1g). Pod memory is 2× heap."
+                          />
+                        </div>
+                      </div>
+                      <label htmlFor="ls-config">Pipeline config.string</label>
+                      <textarea
+                        id="ls-config"
+                        value={logstashConfig}
+                        spellCheck={false}
+                        onChange={(e) => setLogstashConfig(e.target.value)}
+                      />
+                      <div className="deploy-actions">
+                        <button
+                          className="primary"
+                          disabled={
+                            Boolean(busy) ||
+                            !es.exists ||
+                            !version ||
+                            !logstashConfig.trim()
+                          }
+                          title={
+                            !es.exists
+                              ? "Deploy Elasticsearch first"
+                              : undefined
+                          }
+                          onClick={() =>
+                            run("ls-deploy", async () => {
+                              await deployLogstash(
+                                namespace,
+                                version,
+                                logstashConfig,
+                                { heapSize: lsHeapSize || undefined },
+                              );
+                            })
+                          }
+                        >
+                          Deploy
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
-                <div className="summary-item">
-                  <label>Template</label>
-                  <div className="value">ECK quickstart</div>
+
+                <div className="stack-target">
+                  <button
+                    type="button"
+                    className="subsection-toggle"
+                    aria-expanded={stackTarget === "fleet"}
+                    onClick={() => toggleStackTarget("fleet")}
+                  >
+                    <h3 className="subsection-title">Fleet</h3>
+                    <span className="chevron">
+                      {stackTarget === "fleet" ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {stackTarget === "fleet" ? (
+                    <div className="stack-target-body">
+                      <p className="hint panel-hint">
+                        Deploys Fleet Server only (Kibana Fleet config + Agent
+                        CR). Use Agent below for a data-plane Elastic Agent.
+                      </p>
+                      <div className="deploy-actions">
+                        <button
+                          className="primary"
+                          disabled={Boolean(busy) || !es.exists || !version}
+                          title={
+                            !es.exists
+                              ? "Deploy Elasticsearch first"
+                              : undefined
+                          }
+                          onClick={() =>
+                            run("fleet-deploy", async () => {
+                              await deployFleetServer(namespace, version);
+                            })
+                          }
+                        >
+                          Deploy Fleet
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
-                <div className="summary-item">
-                  <label>Components</label>
-                  <div className="value">
-                    {[
-                      es.exists ? "Elasticsearch" : null,
-                      kb.exists ? "Kibana" : null,
-                      ls.exists ? "Logstash" : null,
-                      fleetServer.exists ? "Fleet Server" : null,
-                      elasticAgent.exists ? "Elastic Agent" : null,
-                    ]
-                      .filter(Boolean)
-                      .join(", ") || "none"}
-                  </div>
+
+                <div className="stack-target">
+                  <button
+                    type="button"
+                    className="subsection-toggle"
+                    aria-expanded={stackTarget === "agent"}
+                    onClick={() => toggleStackTarget("agent")}
+                  >
+                    <h3 className="subsection-title">Agent</h3>
+                    <span className="chevron">
+                      {stackTarget === "agent" ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {stackTarget === "agent" ? (
+                    <div className="stack-target-body">
+                      <p className="hint panel-hint">
+                        Deploy an Elastic Agent with a ready-made policy.
+                        Requires Elasticsearch. Applying a configuration
+                        overwrites managed Fleet policies and the Agent CR.
+                      </p>
+                      <div className="namespace-row">
+                        <select
+                          id="fleet-example"
+                          value={selectedExample}
+                          disabled={
+                            Boolean(busy) || fleetExamples.length === 0
+                          }
+                          onChange={(e) => setSelectedExample(e.target.value)}
+                        >
+                          {fleetExamples.map((ex) => (
+                            <option key={ex.id} value={ex.id}>
+                              {ex.name}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="primary"
+                          disabled={
+                            Boolean(busy) ||
+                            !es.exists ||
+                            !version ||
+                            !selectedExample
+                          }
+                          title={
+                            !es.exists
+                              ? "Deploy Elasticsearch first"
+                              : selectedExampleMeta?.description
+                          }
+                          onClick={() =>
+                            run("fleet-example", async () => {
+                              await deployFleetExample(
+                                namespace,
+                                version,
+                                selectedExample,
+                              );
+                            })
+                          }
+                        >
+                          Deploy example
+                        </button>
+                      </div>
+                      {selectedExampleMeta ? (
+                        <p className="hint example-desc">
+                          {selectedExampleMeta.description}
+                          {selectedExampleMeta.note
+                            ? ` ${selectedExampleMeta.note}`
+                            : ""}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="stack-target">
+                  <button
+                    type="button"
+                    className="subsection-toggle"
+                    aria-expanded={stackTarget === "all"}
+                    onClick={() => toggleStackTarget("all")}
+                  >
+                    <h3 className="subsection-title">Deploy full stack</h3>
+                    <span className="chevron">
+                      {stackTarget === "all" ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {stackTarget === "all" ? (
+                    <div className="stack-target-body">
+                      <p className="hint panel-hint">
+                        Elasticsearch, Kibana (Fleet-ready), optional Logstash,
+                        then Fleet Server. Uses ES heap / nodes and LS heap from
+                        the component forms above when set.
+                      </p>
+                      <label className="checkbox-inline">
+                        <input
+                          type="checkbox"
+                          checked={includeLogstash}
+                          disabled={Boolean(busy)}
+                          onChange={(e) =>
+                            setIncludeLogstash(e.target.checked)
+                          }
+                        />
+                        Include Logstash
+                      </label>
+                      <div className="deploy-actions">
+                        <button
+                          className="primary"
+                          disabled={Boolean(busy) || !version}
+                          onClick={() =>
+                            run("deploy-all", async () => {
+                              await deployAllQuickstart(namespace, version, {
+                                includeLogstash,
+                                configString:
+                                  logstashConfig.trim() ||
+                                  DEFAULT_LOGSTASH_CONFIG,
+                                heapSize: heapSize || undefined,
+                                lsHeapSize: lsHeapSize || undefined,
+                                nodeCount,
+                              });
+                            })
+                          }
+                        >
+                          Deploy all
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
-              <div className="deploy-actions">
-                <button
-                  disabled={Boolean(busy) || !version}
-                  onClick={() =>
-                    run("es-deploy", async () => {
-                      await deployElasticsearch(namespace, version, {
-                        heapSize: heapSize || undefined,
-                        nodeCount,
-                      });
-                    })
-                  }
-                >
-                  Deploy Elasticsearch
-                </button>
-                <button
-                  disabled={Boolean(busy) || !es.exists || !version}
-                  title={
-                    !es.exists ? "Deploy Elasticsearch first" : undefined
-                  }
-                  onClick={() =>
-                    run("kb-deploy", async () => {
-                      await deployKibana(namespace, version);
-                    })
-                  }
-                >
-                  Deploy Kibana
-                </button>
-                <button
-                  disabled={Boolean(busy) || !es.exists || !version}
-                  title={
-                    !es.exists ? "Deploy Elasticsearch first" : undefined
-                  }
-                  onClick={openLogstashModal}
-                >
-                  Deploy Logstash
-                </button>
-                <button
-                  disabled={Boolean(busy) || !es.exists || !version}
-                  title={
-                    !es.exists
-                      ? "Deploy Elasticsearch first"
-                      : "Deploy Fleet Server only (use Deploy agent configurations for Elastic Agent)"
-                  }
-                  onClick={() =>
-                    run("fleet-deploy", async () => {
-                      await deployFleetServer(namespace, version);
-                    })
-                  }
-                >
-                  Deploy Fleet
-                </button>
-                <button
-                  className="primary"
-                  disabled={Boolean(busy) || !version}
-                  title="Deploy Elasticsearch, Kibana (Fleet-ready), optional Logstash, then Fleet Server"
-                  onClick={() =>
-                    run("deploy-all", async () => {
-                      await deployAllQuickstart(namespace, version, {
-                        includeLogstash,
-                        configString: DEFAULT_LOGSTASH_CONFIG,
-                        heapSize: heapSize || undefined,
-                        nodeCount,
-                      });
-                    })
-                  }
-                >
-                  Deploy all
-                </button>
-                <label className="checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={includeLogstash}
-                    disabled={Boolean(busy)}
-                    onChange={(e) => setIncludeLogstash(e.target.checked)}
-                  />
-                  Include Logstash in Deploy all
-                </label>
+
+              <div className="deploy-actions stack-destroy">
                 <button
                   className="danger"
                   disabled={Boolean(busy) || !hasInstances}
@@ -708,78 +1080,6 @@ export default function App() {
                 >
                   Destroy all
                 </button>
-              </div>
-              <div className="fleet-examples">
-                <button
-                  type="button"
-                  className="subsection-toggle"
-                  aria-expanded={fleetExamplesOpen}
-                  onClick={() => setFleetExamplesOpen((open) => !open)}
-                >
-                  <h3 className="subsection-title">
-                    Deploy agent configurations
-                  </h3>
-                  <span className="chevron">
-                    {fleetExamplesOpen ? "▾" : "▸"}
-                  </span>
-                </button>
-                {fleetExamplesOpen ? (
-                  <div className="fleet-examples-body">
-                    <p className="hint panel-hint">
-                      Deploy an Elastic Agent with a ready-made policy.
-                      Requires Elasticsearch and Fleet Server. Applying a
-                      configuration overwrites the managed Fleet policies and
-                      Agent CR in this namespace.
-                    </p>
-                    <div className="namespace-row">
-                      <select
-                        id="fleet-example"
-                        value={selectedExample}
-                        disabled={Boolean(busy) || fleetExamples.length === 0}
-                        onChange={(e) => setSelectedExample(e.target.value)}
-                      >
-                        {fleetExamples.map((ex) => (
-                          <option key={ex.id} value={ex.id}>
-                            {ex.name}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        disabled={
-                          Boolean(busy) ||
-                          !es.exists ||
-                          !version ||
-                          !selectedExample
-                        }
-                        title={
-                          !es.exists
-                            ? "Deploy Elasticsearch first"
-                            : selectedExampleMeta?.description
-                        }
-                        onClick={() =>
-                          run("fleet-example", async () => {
-                            await deployFleetExample(
-                              namespace,
-                              version,
-                              selectedExample,
-                            );
-                          })
-                        }
-                      >
-                        Deploy example
-                      </button>
-                    </div>
-                    {selectedExampleMeta ? (
-                      <p className="hint example-desc">
-                        {selectedExampleMeta.description}
-                        {selectedExampleMeta.note
-                          ? ` ${selectedExampleMeta.note}`
-                          : ""}
-                      </p>
-                    ) : null}
-                  </div>
-                ) : null}
               </div>
             </div>
           ) : null}
@@ -888,6 +1188,7 @@ export default function App() {
           </div>
         )}
 
+        {/* Port-forward panel hidden — use Start port-forward on instance cards.
         <section className="panel port-forward-panel">
           <button
             type="button"
@@ -927,7 +1228,9 @@ export default function App() {
             </div>
           ) : null}
         </section>
-      </main>
+        */}
+        </EuiPageTemplate.Section>
+      </EuiPageTemplate>
 
       {logstashModalOpen ? (
         <div
@@ -975,12 +1278,71 @@ export default function App() {
                 disabled={Boolean(busy) || !logstashConfig.trim() || !version}
                 onClick={() =>
                   run("ls-deploy", async () => {
-                    await deployLogstash(namespace, version, logstashConfig);
+                    await deployLogstash(namespace, version, logstashConfig, {
+                      heapSize: lsHeapSize || undefined,
+                    });
                     setLogstashModalOpen(false);
                   })
                 }
               >
                 Deploy
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {trialModalOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !busy) setTrialModalOpen(false);
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="trial-modal-title"
+          >
+            <h2 id="trial-modal-title">Start Enterprise trial?</h2>
+            <p className="hint">
+              This creates the{" "}
+              <code>eck-trial-license</code> secret in{" "}
+              <code>{eckLicense?.operatorNamespace || "elastic-system"}</code>{" "}
+              and starts a 30-day ECK Enterprise trial. A trial can only be
+              activated once. By continuing you accept the{" "}
+              <a
+                href="https://www.elastic.co/eula"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Elastic EULA
+              </a>
+              .
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={() => setTrialModalOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={Boolean(busy)}
+                onClick={() =>
+                  run("eck-trial", async () => {
+                    const next = await startEckTrialLicense();
+                    setEckLicense(next);
+                    setTrialModalOpen(false);
+                  })
+                }
+              >
+                Accept EULA &amp; start trial
               </button>
             </div>
           </div>
@@ -1161,10 +1523,11 @@ export default function App() {
           </div>
         </div>
       ) : null}
-    </div>
+    </>
   );
 }
 
+/* Kept for Port-forward panel restore:
 function PortForwardControls({
   source,
   label,
@@ -1219,6 +1582,7 @@ function PortForwardControls({
     </div>
   );
 }
+*/
 
 function InstanceCard({
   title,

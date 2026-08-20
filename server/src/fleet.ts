@@ -1351,6 +1351,7 @@ export async function deployAllQuickstart(
     includeLogstash?: boolean;
     configString?: string;
     heapSize?: string;
+    lsHeapSize?: string;
     nodeCount?: number;
   } = {},
 ): Promise<void> {
@@ -1364,6 +1365,7 @@ export async function deployAllQuickstart(
       namespace,
       version,
       options.configString?.trim() || DEFAULT_LOGSTASH_CONFIG,
+      { heapSize: options.lsHeapSize },
     );
   }
   await deployFleetServer(namespace, version);

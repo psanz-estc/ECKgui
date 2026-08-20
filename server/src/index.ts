@@ -24,6 +24,7 @@ import {
   deployLogstash,
   getClusterInfo,
   getCredentials,
+  getEckLicenseStatus,
   getElasticsearchStatus,
   getErrorMessage,
   getKibanaStatus,
@@ -31,6 +32,7 @@ import {
   getPodLogs,
   normalizeHeapSize,
   normalizeNodeCount,
+  startEckTrial,
   switchKubeContext,
 } from "./k8s.js";
 import {
@@ -116,6 +118,15 @@ function heapSizeFromBody(body: unknown): string | undefined {
   return undefined;
 }
 
+function lsHeapSizeFromBody(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const record = body as Record<string, unknown>;
+  if (typeof record.lsHeapSize === "string") {
+    return normalizeHeapSize(record.lsHeapSize);
+  }
+  return undefined;
+}
+
 function nodeCountFromBody(body: unknown): number | undefined {
   if (typeof body !== "object" || body === null || !("nodeCount" in body)) {
     return undefined;
@@ -157,6 +168,26 @@ app.post("/api/cluster/context", async (req, reply) => {
     await stopAllPortForwards();
     const info = await getClusterInfo();
     return { ...info, defaultVersion: DEFAULT_VERSION };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/eck/license", async (_req, reply) => {
+  try {
+    return await getEckLicenseStatus();
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/eck/license/trial", async (req, reply) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const acceptEula = body.acceptEula === true;
+    return await startEckTrial({ acceptEula });
   } catch (err) {
     reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
@@ -295,7 +326,9 @@ app.post("/api/logstash", async (req, reply) => {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
     const version = versionFromBody(req.body);
     const configString = configStringFromBody(req.body);
-    await deployLogstash(namespace, version, configString);
+    const heapSize =
+      lsHeapSizeFromBody(req.body) ?? heapSizeFromBody(req.body);
+    await deployLogstash(namespace, version, configString, { heapSize });
     return await getLogstashStatus(namespace);
   } catch (err) {
     const status =
@@ -344,11 +377,13 @@ app.post("/api/quickstart/deploy-all", async (req, reply) => {
     const configString =
       typeof body.configString === "string" ? body.configString : undefined;
     const heapSize = heapSizeFromBody(body);
+    const lsHeapSize = lsHeapSizeFromBody(body);
     const nodeCount = nodeCountFromBody(body);
     await deployAllQuickstart(namespace, version, {
       includeLogstash,
       configString,
       heapSize,
+      lsHeapSize,
       nodeCount,
     });
     return { ok: true };

@@ -17,6 +17,9 @@ export type ClusterInfo = {
   contexts: string[];
   server: string;
   namespaces: string[];
+  reachable: boolean;
+  eckInstalled: boolean;
+  error?: string;
 };
 
 export type PodInfo = {
@@ -80,6 +83,18 @@ type CoreApi = {
     name: string;
     namespace: string;
   }) => Promise<k8s.V1Secret>;
+  createNamespacedSecret: (p: {
+    namespace: string;
+    body: k8s.V1Secret;
+  }) => Promise<k8s.V1Secret>;
+  listNamespacedSecret: (p: {
+    namespace: string;
+    labelSelector?: string;
+  }) => Promise<{ items?: k8s.V1Secret[] }>;
+  readNamespacedConfigMap: (p: {
+    name: string;
+    namespace: string;
+  }) => Promise<k8s.V1ConfigMap>;
   readNamespacedPodLog: (p: {
     name: string;
     namespace: string;
@@ -131,22 +146,73 @@ function podRestarts(pod: k8s.V1Pod): number {
 }
 
 export async function getClusterInfo(): Promise<ClusterInfo> {
-  const { kc, core } = clients();
-  const context = kc.getCurrentContext() || "unknown";
-  const contexts = listKubeContexts();
-  const cluster = kc.getCurrentCluster();
-  const nsList = await core.listNamespace();
-  const namespaces = (nsList.items ?? [])
-    .map((n) => n.metadata?.name)
-    .filter((n): n is string => Boolean(n))
-    .sort();
+  let context = "unknown";
+  let contexts: string[] = [];
+  let server = "unknown";
 
-  return {
-    context,
-    contexts: contexts.length > 0 ? contexts : [context],
-    server: cluster?.server || "unknown",
-    namespaces: namespaces.length > 0 ? namespaces : ["default"],
-  };
+  try {
+    const { kc } = clients();
+    context = kc.getCurrentContext() || "unknown";
+    contexts = listKubeContexts();
+    server = kc.getCurrentCluster()?.server || "unknown";
+  } catch (err) {
+    return {
+      context,
+      contexts: contexts.length > 0 ? contexts : [context],
+      server,
+      namespaces: ["default"],
+      reachable: false,
+      eckInstalled: false,
+      error: getErrorMessage(err),
+    };
+  }
+
+  try {
+    const { core } = clients();
+    const nsList = await core.listNamespace();
+    const namespaces = (nsList.items ?? [])
+      .map((n) => n.metadata?.name)
+      .filter((n): n is string => Boolean(n))
+      .sort();
+
+    const eckInstalled = await detectEckInstalled();
+
+    return {
+      context,
+      contexts: contexts.length > 0 ? contexts : [context],
+      server,
+      namespaces: namespaces.length > 0 ? namespaces : ["default"],
+      reachable: true,
+      eckInstalled,
+    };
+  } catch (err) {
+    return {
+      context,
+      contexts: contexts.length > 0 ? contexts : [context],
+      server,
+      namespaces: ["default"],
+      reachable: false,
+      eckInstalled: false,
+      error: getErrorMessage(err),
+    };
+  }
+}
+
+async function detectEckInstalled(): Promise<boolean> {
+  try {
+    const { kc } = clients();
+    const api = kc.makeApiClient(k8s.ApiextensionsV1Api) as {
+      readCustomResourceDefinition: (p: {
+        name: string;
+      }) => Promise<unknown>;
+    };
+    await api.readCustomResourceDefinition({
+      name: "elasticsearches.elasticsearch.k8s.elastic.co",
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function switchKubeContext(context: string): string {
@@ -320,45 +386,72 @@ function buildLogstashManifest(
   version: string,
   namespace: string,
   configString: string,
+  options: { heapSize?: string } = {},
 ) {
+  const spec: Record<string, unknown> = {
+    count: 1,
+    version,
+    elasticsearchRefs: [
+      {
+        name: RESOURCE_NAME,
+        clusterName: "qs",
+      },
+    ],
+    pipelines: [
+      {
+        "pipeline.id": "main",
+        "config.string": configString,
+      },
+    ],
+    services: [
+      {
+        name: "beats",
+        service: {
+          spec: {
+            type: "NodePort",
+            ports: [
+              {
+                port: 5044,
+                name: "filebeat",
+                protocol: "TCP",
+                targetPort: 5044,
+              },
+            ],
+          },
+        },
+      },
+    ],
+  };
+
+  const heap = normalizeHeapSize(options.heapSize);
+  if (heap) {
+    const memory = memoryLimitForHeap(heap);
+    spec.podTemplate = {
+      spec: {
+        containers: [
+          {
+            name: "logstash",
+            env: [
+              {
+                name: "LS_JAVA_OPTS",
+                value: `-Xms${heap} -Xmx${heap}`,
+              },
+            ],
+            resources: {
+              requests: { memory },
+              limits: { memory },
+            },
+          },
+        ],
+      },
+    };
+  }
+
   return {
     apiVersion: `${LS_GROUP}/${LS_API_VERSION}`,
     kind: "Logstash",
     metadata: { name: RESOURCE_NAME, namespace },
-    spec: {
-      count: 1,
-      version,
-      elasticsearchRefs: [
-        {
-          name: RESOURCE_NAME,
-          clusterName: "qs",
-        },
-      ],
-      pipelines: [
-        {
-          "pipeline.id": "main",
-          "config.string": configString,
-        },
-      ],
-      services: [
-        {
-          name: "beats",
-          service: {
-            spec: {
-              type: "NodePort",
-              ports: [
-                {
-                  port: 5044,
-                  name: "filebeat",
-                  protocol: "TCP",
-                  targetPort: 5044,
-                },
-              ],
-            },
-          },
-        },
-      ],
-    },
+    spec,
   };
 }
 
@@ -498,9 +591,10 @@ export async function deployLogstash(
   namespace: string,
   version: string,
   configString: string,
+  options: { heapSize?: string } = {},
 ): Promise<void> {
   const { custom } = clients();
-  const body = buildLogstashManifest(version, namespace, configString);
+  const body = buildLogstashManifest(version, namespace, configString, options);
   try {
     await custom.createNamespacedCustomObject({
       group: LS_GROUP,
@@ -906,6 +1000,143 @@ function isAlreadyExists(err: unknown): boolean {
 
 function isNotFound(err: unknown): boolean {
   return getStatusCode(err) === 404;
+}
+
+const ECK_OPERATOR_NAMESPACE = "elastic-system";
+const ECK_TRIAL_SECRET_NAME = "eck-trial-license";
+const ECK_LICENSING_CONFIGMAP = "elastic-licensing";
+export const ECK_EULA_URL = "https://www.elastic.co/eula";
+
+export type EckLicenseStatus = {
+  operatorNamespace: string;
+  level: string;
+  trialSecretExists: boolean;
+  canStartTrial: boolean;
+  message?: string;
+};
+
+export async function getEckLicenseStatus(): Promise<EckLicenseStatus> {
+  const { core } = clients();
+  const operatorNamespace = ECK_OPERATOR_NAMESPACE;
+
+  let level = "unknown";
+  try {
+    const cm = await core.readNamespacedConfigMap({
+      name: ECK_LICENSING_CONFIGMAP,
+      namespace: operatorNamespace,
+    });
+    const raw = cm.data?.eck_license_level?.trim();
+    if (raw) level = raw.toLowerCase();
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+    return {
+      operatorNamespace,
+      level: "unknown",
+      trialSecretExists: false,
+      canStartTrial: false,
+      message:
+        "ECK licensing ConfigMap not found. Is the operator installed in elastic-system?",
+    };
+  }
+
+  let trialSecretExists = false;
+  try {
+    await core.readNamespacedSecret({
+      name: ECK_TRIAL_SECRET_NAME,
+      namespace: operatorNamespace,
+    });
+    trialSecretExists = true;
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+  }
+
+  if (!trialSecretExists) {
+    try {
+      const listed = await core.listNamespacedSecret({
+        namespace: operatorNamespace,
+        labelSelector: "license.k8s.elastic.co/type=enterprise_trial",
+      });
+      trialSecretExists = (listed.items ?? []).length > 0;
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
+  }
+
+  const levelIsBasic = level === "basic" || level === "unknown";
+  const canStartTrial = levelIsBasic && !trialSecretExists;
+
+  let message: string | undefined;
+  if (trialSecretExists && levelIsBasic) {
+    message =
+      "A trial secret already exists (or a trial was used before). ECK only allows one trial activation.";
+  } else if (!levelIsBasic) {
+    message = `Current ECK license level is "${level}".`;
+  }
+
+  return {
+    operatorNamespace,
+    level,
+    trialSecretExists,
+    canStartTrial,
+    message,
+  };
+}
+
+/** Start a 30-day Enterprise trial (requires accepting the Elastic EULA). */
+export async function startEckTrial(options: {
+  acceptEula: boolean;
+}): Promise<EckLicenseStatus> {
+  if (!options.acceptEula) {
+    const err = new Error(
+      `You must accept the Elastic EULA (${ECK_EULA_URL}) to start a trial.`,
+    ) as Error & { statusCode: number };
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const status = await getEckLicenseStatus();
+  if (!status.canStartTrial) {
+    const err = new Error(
+      status.message ||
+        "Cannot start an Enterprise trial with the current license state.",
+    ) as Error & { statusCode: number };
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const { core } = clients();
+  try {
+    await core.createNamespacedSecret({
+      namespace: status.operatorNamespace,
+      body: {
+        apiVersion: "v1",
+        kind: "Secret",
+        metadata: {
+          name: ECK_TRIAL_SECRET_NAME,
+          namespace: status.operatorNamespace,
+          labels: {
+            "license.k8s.elastic.co/type": "enterprise_trial",
+          },
+          annotations: {
+            "elastic.co/eula": "accepted",
+          },
+        },
+      },
+    });
+  } catch (err) {
+    if (isAlreadyExists(err)) {
+      const conflict = new Error(
+        "Trial license secret already exists. A trial can only be initiated once.",
+      ) as Error & { statusCode: number };
+      conflict.statusCode = 409;
+      throw conflict;
+    }
+    throw err;
+  }
+
+  // Operator updates elastic-licensing asynchronously; return refreshed best-effort status.
+  await new Promise((r) => setTimeout(r, 2_000));
+  return getEckLicenseStatus();
 }
 
 function getStatusCode(err: unknown): number | undefined {

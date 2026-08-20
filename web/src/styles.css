@@ -11,8 +11,8 @@
   --warn: #f5a524;
   --danger: #f07178;
   --ok: #24c292;
-  --font: "IBM Plex Sans", sans-serif;
-  --mono: "IBM Plex Mono", monospace;
+  --font: "Inter", "IBM Plex Sans", sans-serif;
+  --mono: "Roboto Mono", "IBM Plex Mono", monospace;
 }
 
 * {
@@ -26,93 +26,22 @@ body,
   min-height: 100%;
 }
 
+/* EUI owns page chrome; keep token colors for legacy Stack/Instances panels. */
 body {
   font-family: var(--font);
   color: var(--text);
-  background:
-    radial-gradient(900px 420px at 0% 0%, #10263a 0%, transparent 55%),
-    var(--bg0);
+  background: transparent;
 }
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
-.app-shell {
-  min-height: 100vh;
-}
-
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 0.75rem 1.5rem;
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--bg1) 92%, black);
-}
-
-.topbar-brand {
-  display: flex;
-  align-items: center;
-  gap: 0.55rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-}
-
-.topbar-logo {
-  width: 28px;
-  height: 28px;
-  display: block;
-}
-
-.topbar-meta {
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  color: var(--muted);
-}
-
-.page {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 1.5rem 1.25rem 3rem;
-}
-
-.crumbs {
-  margin: 0 0 1rem;
-  color: var(--muted);
-  font-size: 0.85rem;
-}
-
-.crumbs span {
-  color: var(--text);
-}
-
-.deploy-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 1.25rem;
-}
-
-.deploy-title {
-  display: flex;
-  flex-direction: column;
-  gap: 0.45rem;
-}
-
-.deploy-title h1 {
-  margin: 0;
-  font-size: clamp(1.8rem, 3vw, 2.35rem);
-  letter-spacing: -0.03em;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.65rem;
+.eckgui-page {
+  min-height: calc(100vh - 48px);
 }
 
 .badge {
@@ -179,7 +108,11 @@ select {
   gap: 0.5rem;
 }
 
-button {
+/* Scope native control styles to legacy panels — do not fight EUI chrome. */
+.panel button,
+.instance-card button,
+.modal button,
+.pf-row button {
   border: 1px solid var(--line);
   background: var(--bg2);
   color: var(--text);
@@ -187,21 +120,32 @@ button {
   cursor: pointer;
 }
 
-button.primary {
+.panel button.primary,
+.instance-card button.primary,
+.modal button.primary,
+.pf-row button.primary {
   background: var(--accent-strong);
   border-color: color-mix(in srgb, var(--accent) 70%, white);
 }
 
-button.danger {
+.panel button.danger,
+.instance-card button.danger,
+.modal button.danger,
+.pf-row button.danger {
   border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
   color: #ffd0d3;
 }
 
-button.ghost {
+.panel button.ghost,
+.instance-card button.ghost,
+.modal button.ghost {
   background: transparent;
 }
 
-button:disabled {
+.panel button:disabled,
+.instance-card button:disabled,
+.modal button:disabled,
+.pf-row button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
@@ -289,6 +233,44 @@ button:disabled {
   margin: 0;
   font-size: 0.95rem;
   font-weight: 600;
+}
+
+.panel-title .k8s-status-badge {
+  margin-left: 0.55rem;
+  vertical-align: middle;
+  font-size: 0.72rem;
+}
+
+.stack-targets {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin-top: 1rem;
+}
+
+.stack-target {
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: 10px;
+  padding: 0.65rem 0.75rem;
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+}
+
+.stack-target-body {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.stack-target-body textarea {
+  min-height: 140px;
+  width: 100%;
+}
+
+.stack-destroy {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
 
 .fleet-examples-body {

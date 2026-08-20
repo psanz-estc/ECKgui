@@ -4,6 +4,17 @@ export type ClusterInfo = {
   server: string;
   namespaces: string[];
   defaultVersion: string;
+  reachable: boolean;
+  eckInstalled: boolean;
+  error?: string;
+};
+
+export type EckLicenseStatus = {
+  operatorNamespace: string;
+  level: string;
+  trialSecretExists: boolean;
+  canStartTrial: boolean;
+  message?: string;
 };
 
 export type PodInfo = {
@@ -94,6 +105,17 @@ export function setClusterContext(context: string) {
   });
 }
 
+export function getEckLicense() {
+  return request<EckLicenseStatus>("/api/eck/license");
+}
+
+export function startEckTrialLicense() {
+  return request<EckLicenseStatus>("/api/eck/license/trial", {
+    method: "POST",
+    body: JSON.stringify({ acceptEula: true }),
+  });
+}
+
 export function createNamespace(name: string) {
   return request<ClusterInfo & { name: string }>("/api/namespaces", {
     method: "POST",
@@ -181,12 +203,18 @@ export function deployLogstash(
   namespace: string,
   version: string,
   configString: string,
+  options: { heapSize?: string } = {},
 ) {
+  const { heapSize } = options;
   return request<ResourceStatus>(
     `/api/logstash?namespace=${encodeURIComponent(namespace)}`,
     {
       method: "POST",
-      body: JSON.stringify({ version, configString }),
+      body: JSON.stringify({
+        version,
+        configString,
+        ...(heapSize?.trim() ? { lsHeapSize: heapSize.trim() } : {}),
+      }),
     },
   );
 }
@@ -212,10 +240,11 @@ export function deployAllQuickstart(
     includeLogstash?: boolean;
     configString?: string;
     heapSize?: string;
+    lsHeapSize?: string;
     nodeCount?: number;
   } = {},
 ) {
-  const { heapSize, nodeCount, ...rest } = options;
+  const { heapSize, lsHeapSize, nodeCount, ...rest } = options;
   return request<{ ok: boolean }>(
     `/api/quickstart/deploy-all?namespace=${encodeURIComponent(namespace)}`,
     {
@@ -224,6 +253,7 @@ export function deployAllQuickstart(
         version,
         ...rest,
         ...(heapSize?.trim() ? { heapSize: heapSize.trim() } : {}),
+        ...(lsHeapSize?.trim() ? { lsHeapSize: lsHeapSize.trim() } : {}),
         ...(typeof nodeCount === "number" ? { nodeCount } : {}),
       }),
     },
