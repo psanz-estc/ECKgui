@@ -233,12 +233,77 @@ textarea {
   margin: 0;
   font-size: 0.95rem;
   font-weight: 600;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.subsection-version {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--muted);
 }
 
 .panel-title .k8s-status-badge {
   margin-left: 0.55rem;
   vertical-align: middle;
   font-size: 0.72rem;
+}
+
+.ram-meter {
+  margin-top: 0.75rem;
+}
+
+.ram-meter-label {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.ram-meter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.ram-meter-status {
+  flex: 0 0 auto;
+  min-width: 4.25rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.ram-meter-track {
+  flex: 1 1 auto;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line) 80%, var(--bg2));
+  overflow: hidden;
+}
+
+.ram-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 55%, var(--line));
+  transition: width 0.25s ease;
+}
+
+.ram-meter-high .ram-meter-fill {
+  background: var(--warn);
+}
+
+.ram-meter-critical .ram-meter-fill {
+  background: var(--danger);
+}
+
+.ram-meter-pct {
+  flex: 0 0 auto;
+  min-width: 2.4rem;
+  text-align: right;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
 }
 
 .stack-targets {

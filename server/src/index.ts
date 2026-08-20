@@ -11,7 +11,20 @@ import {
   getElasticAgentStatus,
   getFleetServerStatus,
   listFleetExamples,
+  upgradeAllQuickstart,
+  upgradeElasticAgent,
+  upgradeFleetServer,
 } from "./fleet.js";
+import {
+  getEckOperatorStatus,
+  installOrUpgradeEckOperator,
+  listEckOperatorVersions,
+  uninstallEckOperator,
+} from "./eck.js";
+import {
+  DEFAULT_STACK_VERSION,
+  listElasticStackVersions,
+} from "./stack-versions.js";
 import {
   createNamespace,
   deleteElasticsearch,
@@ -23,6 +36,7 @@ import {
   deployKibana,
   deployLogstash,
   getClusterInfo,
+  getClusterMemory,
   getCredentials,
   getEckLicenseStatus,
   getElasticsearchStatus,
@@ -34,6 +48,11 @@ import {
   normalizeNodeCount,
   startEckTrial,
   switchKubeContext,
+  watchClusterMemory,
+  upgradeElasticsearch,
+  updateElasticsearchTopology,
+  upgradeKibana,
+  upgradeLogstash,
 } from "./k8s.js";
 import {
   getPortForwardStatus,
@@ -42,6 +61,7 @@ import {
   stopAllPortForwards,
   stopPortForward,
 } from "./portforward.js";
+import { loadKubeConfig } from "./kubeconfig.js";
 
 function statusFromError(err: unknown): number {
   if (
@@ -55,7 +75,7 @@ function statusFromError(err: unknown): number {
   return 500;
 }
 
-const DEFAULT_VERSION = "9.5.0";
+const DEFAULT_VERSION = DEFAULT_STACK_VERSION;
 const PORT = Number(process.env.PORT || 8787);
 
 const app = Fastify({ logger: true });
@@ -106,16 +126,30 @@ function namespaceFromQuery(query: Record<string, unknown>): string {
   return ns;
 }
 
-function heapSizeFromBody(body: unknown): string | undefined {
-  if (
-    typeof body === "object" &&
-    body !== null &&
-    "heapSize" in body &&
-    typeof (body as { heapSize: unknown }).heapSize === "string"
-  ) {
-    return normalizeHeapSize((body as { heapSize: string }).heapSize);
+function heapSizeFieldFromBody(body: unknown): {
+  provided: boolean;
+  value?: string;
+} {
+  if (typeof body !== "object" || body === null || !("heapSize" in body)) {
+    return { provided: false };
   }
-  return undefined;
+  const raw = (body as { heapSize: unknown }).heapSize;
+  if (raw == null || (typeof raw === "string" && !raw.trim())) {
+    return { provided: true, value: undefined };
+  }
+  if (typeof raw !== "string") {
+    const err = new Error(
+      'Invalid heapSize. Use forms like "512m", "1g", or "2g".',
+    ) as Error & { statusCode: number };
+    err.statusCode = 400;
+    throw err;
+  }
+  return { provided: true, value: normalizeHeapSize(raw) };
+}
+
+function heapSizeFromBody(body: unknown): string | undefined {
+  const field = heapSizeFieldFromBody(body);
+  return field.provided ? field.value : undefined;
 }
 
 function lsHeapSizeFromBody(body: unknown): string | undefined {
@@ -159,6 +193,52 @@ app.get("/api/cluster", async (_req, reply) => {
   }
 });
 
+app.get("/api/cluster/memory", async (req, reply) => {
+  reply.hijack();
+  req.raw.setTimeout(0);
+  reply.raw.setTimeout(0);
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const startedContext = loadKubeConfig().getCurrentContext();
+  const abort = new AbortController();
+  const writeEvent = (memory: Awaited<ReturnType<typeof getClusterMemory>>) => {
+    if (reply.raw.writableEnded) return;
+    reply.raw.write(`data: ${JSON.stringify(memory)}\n\n`);
+  };
+
+  try {
+    writeEvent(await getClusterMemory());
+  } catch {
+    // Stream still useful once the watch or a later snapshot succeeds.
+  }
+
+  void watchClusterMemory(writeEvent, abort.signal).catch(() => undefined);
+
+  const heartbeat = setInterval(() => {
+    if (reply.raw.writableEnded) return;
+    if (loadKubeConfig().getCurrentContext() !== startedContext) {
+      abort.abort();
+      clearInterval(heartbeat);
+      reply.raw.end();
+      return;
+    }
+    reply.raw.write(": ping\n\n");
+  }, 15000);
+
+  const close = () => {
+    abort.abort();
+    clearInterval(heartbeat);
+    if (!reply.raw.writableEnded) reply.raw.end();
+  };
+  req.raw.on("close", close);
+  req.raw.on("aborted", close);
+});
+
 app.post("/api/cluster/context", async (req, reply) => {
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
@@ -168,6 +248,59 @@ app.post("/api/cluster/context", async (req, reply) => {
     await stopAllPortForwards();
     const info = await getClusterInfo();
     return { ...info, defaultVersion: DEFAULT_VERSION };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/eck/operator", async (_req, reply) => {
+  try {
+    return await getEckOperatorStatus();
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/eck/operator/versions", async (_req, reply) => {
+  try {
+    return await listEckOperatorVersions();
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/stack/versions", async (_req, reply) => {
+  try {
+    return await listElasticStackVersions();
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/eck/operator", async (req, reply) => {
+  try {
+    const version = versionFromBody(req.body);
+    return await installOrUpgradeEckOperator(version);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/eck/operator", async (req, reply) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const query = req.query as Record<string, unknown>;
+    const deleteCrds = body.deleteCrds === true || query.deleteCrds === "true";
+    const version =
+      typeof body.version === "string" && body.version.trim()
+        ? body.version.trim()
+        : undefined;
+    return await uninstallEckOperator({ deleteCrds, version });
   } catch (err) {
     reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
@@ -245,6 +378,42 @@ app.post("/api/elasticsearch", async (req, reply) => {
   }
 });
 
+app.patch("/api/elasticsearch", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const version =
+      typeof req.body === "object" &&
+      req.body !== null &&
+      "version" in req.body &&
+      typeof (req.body as { version: unknown }).version === "string"
+        ? (req.body as { version: string }).version.trim()
+        : "";
+    const nodeCount = nodeCountFromBody(req.body);
+    const heapField = heapSizeFieldFromBody(req.body);
+    if (!version && nodeCount === undefined && !heapField.provided) {
+      const err = new Error(
+        "version, nodeCount, or heapSize is required",
+      ) as Error & { statusCode: number };
+      err.statusCode = 400;
+      throw err;
+    }
+    if (version) {
+      await upgradeElasticsearch(namespace, version);
+    }
+    if (nodeCount !== undefined || heapField.provided) {
+      await updateElasticsearchTopology(namespace, {
+        nodeCount,
+        heapSize: heapField.value,
+        patchHeap: heapField.provided,
+      });
+    }
+    return await getElasticsearchStatus(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
 app.get("/api/pods/:name/logs", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
@@ -286,6 +455,18 @@ app.post("/api/kibana", async (req, reply) => {
     return await getKibanaStatus(namespace);
   } catch (err) {
     reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.patch("/api/kibana", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const version = versionFromBody(req.body);
+    await upgradeKibana(namespace, version);
+    return await getKibanaStatus(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
   }
 });
@@ -343,6 +524,18 @@ app.post("/api/logstash", async (req, reply) => {
   }
 });
 
+app.patch("/api/logstash", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const version = versionFromBody(req.body);
+    await upgradeLogstash(namespace, version);
+    return await getLogstashStatus(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
 app.delete("/api/logstash", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
@@ -387,6 +580,18 @@ app.post("/api/quickstart/deploy-all", async (req, reply) => {
       nodeCount,
     });
     return { ok: true };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/quickstart/upgrade", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const version = versionFromBody(req.body);
+    const result = await upgradeAllQuickstart(namespace, version);
+    return { ok: true, ...result };
   } catch (err) {
     reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
@@ -445,6 +650,18 @@ app.post("/api/fleet-server", async (req, reply) => {
   }
 });
 
+app.patch("/api/fleet-server", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const version = versionFromBody(req.body);
+    await upgradeFleetServer(namespace, version);
+    return await getFleetServerStatus(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
 app.delete("/api/fleet-server", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
@@ -462,6 +679,18 @@ app.get("/api/elastic-agent", async (req, reply) => {
     return await getElasticAgentStatus(namespace);
   } catch (err) {
     reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.patch("/api/elastic-agent", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const version = versionFromBody(req.body);
+    await upgradeElasticAgent(namespace, version);
+    return await getElasticAgentStatus(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
   }
 });

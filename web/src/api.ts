@@ -1,3 +1,40 @@
+export type EckOperatorPhase =
+  | "not_installed"
+  | "installing"
+  | "unhealthy"
+  | "running";
+
+export type EckOperatorStatus = {
+  operatorNamespace: string;
+  installed: boolean;
+  ready: boolean;
+  version?: string;
+  phase: EckOperatorPhase;
+  message?: string;
+  podName?: string;
+  podPhase?: string;
+};
+
+export type EckOperatorVersionList = {
+  defaultVersion: string;
+  versions: string[];
+  source: "github" | "fallback";
+};
+
+export type StackVersionList = {
+  defaultVersion: string;
+  versions: string[];
+  source: "artifacts" | "github" | "fallback";
+};
+
+export type ClusterMemory = {
+  allocatableBytes: number;
+  requestBytes: number;
+  remainingBytes: number;
+  percent: number;
+  nodeCount: number;
+};
+
 export type ClusterInfo = {
   context: string;
   contexts: string[];
@@ -6,6 +43,8 @@ export type ClusterInfo = {
   defaultVersion: string;
   reachable: boolean;
   eckInstalled: boolean;
+  eck: EckOperatorStatus;
+  memory?: ClusterMemory;
   error?: string;
 };
 
@@ -49,6 +88,7 @@ export type ResourceStatus = {
   phase?: string;
   nodes?: number;
   count?: number;
+  heapSize?: string;
   pods: PodInfo[];
   configString?: string | null;
   services?: ServiceInfo[];
@@ -102,6 +142,35 @@ export function setClusterContext(context: string) {
   return request<ClusterInfo>("/api/cluster/context", {
     method: "POST",
     body: JSON.stringify({ context }),
+  });
+}
+
+export function getEckOperator() {
+  return request<EckOperatorStatus>("/api/eck/operator");
+}
+
+export function getEckOperatorVersions() {
+  return request<EckOperatorVersionList>("/api/eck/operator/versions");
+}
+
+export function getStackVersions() {
+  return request<StackVersionList>("/api/stack/versions");
+}
+
+export function installEckOperator(version: string) {
+  return request<EckOperatorStatus>("/api/eck/operator", {
+    method: "POST",
+    body: JSON.stringify({ version }),
+  });
+}
+
+export function uninstallEckOperator(options: {
+  deleteCrds?: boolean;
+  version?: string;
+} = {}) {
+  return request<EckOperatorStatus>("/api/eck/operator", {
+    method: "DELETE",
+    body: JSON.stringify(options),
   });
 }
 
@@ -163,6 +232,33 @@ export function deployElasticsearch(
   );
 }
 
+export function upgradeElasticsearch(namespace: string, version: string) {
+  return request<ResourceStatus>(
+    `/api/elasticsearch?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ version }),
+    },
+  );
+}
+
+export function updateElasticsearchTopology(
+  namespace: string,
+  options: { heapSize?: string; nodeCount: number },
+) {
+  const { heapSize, nodeCount } = options;
+  return request<ResourceStatus>(
+    `/api/elasticsearch?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        nodeCount,
+        heapSize: heapSize?.trim() ?? "",
+      }),
+    },
+  );
+}
+
 export function deleteElasticsearch(namespace: string) {
   return request<{ ok: boolean }>(
     `/api/elasticsearch?namespace=${encodeURIComponent(namespace)}`,
@@ -181,6 +277,16 @@ export function deployKibana(namespace: string, version: string) {
     `/api/kibana?namespace=${encodeURIComponent(namespace)}`,
     {
       method: "POST",
+      body: JSON.stringify({ version }),
+    },
+  );
+}
+
+export function upgradeKibana(namespace: string, version: string) {
+  return request<ResourceStatus>(
+    `/api/kibana?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "PATCH",
       body: JSON.stringify({ version }),
     },
   );
@@ -226,6 +332,16 @@ export function deleteLogstash(namespace: string) {
   );
 }
 
+export function upgradeLogstash(namespace: string, version: string) {
+  return request<ResourceStatus>(
+    `/api/logstash?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ version }),
+    },
+  );
+}
+
 export function destroyQuickstart(namespace: string) {
   return request<{ ok: boolean }>(
     `/api/quickstart?namespace=${encodeURIComponent(namespace)}`,
@@ -256,6 +372,16 @@ export function deployAllQuickstart(
         ...(lsHeapSize?.trim() ? { lsHeapSize: lsHeapSize.trim() } : {}),
         ...(typeof nodeCount === "number" ? { nodeCount } : {}),
       }),
+    },
+  );
+}
+
+export function upgradeAllQuickstart(namespace: string, version: string) {
+  return request<{ ok: boolean; upgraded: string[] }>(
+    `/api/quickstart/upgrade?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ version }),
     },
   );
 }
@@ -318,6 +444,16 @@ export function deployFleetServer(namespace: string, version: string) {
   );
 }
 
+export function upgradeFleetServer(namespace: string, version: string) {
+  return request<ResourceStatus>(
+    `/api/fleet-server?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ version }),
+    },
+  );
+}
+
 export function deleteFleetServer(namespace: string) {
   return request<{ ok: boolean }>(
     `/api/fleet-server?namespace=${encodeURIComponent(namespace)}`,
@@ -328,6 +464,16 @@ export function deleteFleetServer(namespace: string) {
 export function getElasticAgent(namespace: string) {
   return request<ResourceStatus>(
     `/api/elastic-agent?namespace=${encodeURIComponent(namespace)}`,
+  );
+}
+
+export function upgradeElasticAgent(namespace: string, version: string) {
+  return request<ResourceStatus>(
+    `/api/elastic-agent?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ version }),
+    },
   );
 }
 

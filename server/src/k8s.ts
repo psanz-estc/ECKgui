@@ -1,5 +1,11 @@
 import * as k8s from "@kubernetes/client-node";
 import {
+  compareVersions,
+  emptyEckOperatorStatus,
+  getEckOperatorStatus,
+  type EckOperatorStatus,
+} from "./eck.js";
+import {
   listKubeContexts,
   loadKubeConfig,
   setActiveContext,
@@ -12,6 +18,14 @@ const API_VERSION = "v1";
 const LS_API_VERSION = "v1alpha1";
 const RESOURCE_NAME = "quickstart";
 
+export type ClusterMemory = {
+  allocatableBytes: number;
+  requestBytes: number;
+  remainingBytes: number;
+  percent: number;
+  nodeCount: number;
+};
+
 export type ClusterInfo = {
   context: string;
   contexts: string[];
@@ -19,6 +33,8 @@ export type ClusterInfo = {
   namespaces: string[];
   reachable: boolean;
   eckInstalled: boolean;
+  eck: EckOperatorStatus;
+  memory?: ClusterMemory;
   error?: string;
 };
 
@@ -55,6 +71,7 @@ export type ResourceStatus = {
   phase?: string;
   nodes?: number;
   count?: number;
+  heapSize?: string;
   pods: PodInfo[];
   configString?: string | null;
   services?: ServiceInfo[];
@@ -63,6 +80,7 @@ export type ResourceStatus = {
 type CustomApi = {
   createNamespacedCustomObject: (p: Record<string, unknown>) => Promise<unknown>;
   replaceNamespacedCustomObject: (p: Record<string, unknown>) => Promise<unknown>;
+  patchNamespacedCustomObject: (p: Record<string, unknown>) => Promise<unknown>;
   deleteNamespacedCustomObject: (p: Record<string, unknown>) => Promise<unknown>;
   getNamespacedCustomObject: (p: Record<string, unknown>) => Promise<unknown>;
 };
@@ -101,6 +119,8 @@ type CoreApi = {
     tailLines?: number;
     timestamps?: boolean;
   }) => Promise<string>;
+  listNode: () => Promise<{ items?: k8s.V1Node[] }>;
+  listPodForAllNamespaces: () => Promise<{ items?: k8s.V1Pod[] }>;
   listNamespacedPersistentVolumeClaim: (p: {
     namespace: string;
   }) => Promise<{ items?: k8s.V1PersistentVolumeClaim[] }>;
@@ -145,6 +165,123 @@ function podRestarts(pod: k8s.V1Pod): number {
   );
 }
 
+const MEMORY_SUFFIX: Record<string, number> = {
+  Ki: 1024,
+  Mi: 1024 ** 2,
+  Gi: 1024 ** 3,
+  Ti: 1024 ** 4,
+  Pi: 1024 ** 5,
+  Ei: 1024 ** 6,
+  n: 1e-9,
+  u: 1e-6,
+  m: 1e-3,
+  k: 1e3,
+  K: 1e3,
+  M: 1e6,
+  G: 1e9,
+  T: 1e12,
+  P: 1e15,
+  E: 1e18,
+};
+
+export function parseQuantityToBytes(quantity?: string): number {
+  if (!quantity) return 0;
+  const match = /^([0-9]+(?:\.[0-9]+)?)([eE][+-]?[0-9]+)?([a-zA-Z]+)?$/.exec(
+    quantity.trim(),
+  );
+  if (!match) return 0;
+  let value = Number(`${match[1]}${match[2] ?? ""}`);
+  if (!Number.isFinite(value)) return 0;
+  const suffix = match[3] ?? "";
+  if (suffix) {
+    const factor = MEMORY_SUFFIX[suffix];
+    if (factor == null) return 0;
+    value *= factor;
+  }
+  return Math.max(0, Math.round(value));
+}
+
+function containerMemoryRequests(
+  containers: k8s.V1Container[] | undefined,
+): number {
+  return (containers ?? []).reduce((sum, container) => {
+    return sum + parseQuantityToBytes(container.resources?.requests?.memory);
+  }, 0);
+}
+
+function podMemoryRequestBytes(pod: k8s.V1Pod): number {
+  const phase = pod.status?.phase;
+  if (phase === "Succeeded" || phase === "Failed") return 0;
+  return (
+    containerMemoryRequests(pod.spec?.initContainers) +
+    containerMemoryRequests(pod.spec?.containers) +
+    parseQuantityToBytes(pod.spec?.overhead?.memory)
+  );
+}
+
+export async function getClusterMemory(): Promise<ClusterMemory> {
+  const { core } = clients();
+  const [nodes, pods] = await Promise.all([
+    core.listNode(),
+    core.listPodForAllNamespaces(),
+  ]);
+  const nodeItems = nodes.items ?? [];
+  const allocatableBytes = nodeItems.reduce((sum, node) => {
+    return sum + parseQuantityToBytes(node.status?.allocatable?.memory);
+  }, 0);
+  const requestBytes = (pods.items ?? []).reduce((sum, pod) => {
+    return sum + podMemoryRequestBytes(pod);
+  }, 0);
+  const remainingBytes = Math.max(0, allocatableBytes - requestBytes);
+  const percent =
+    allocatableBytes > 0
+      ? Math.min(100, (requestBytes / allocatableBytes) * 100)
+      : 0;
+  return {
+    allocatableBytes,
+    requestBytes,
+    remainingBytes,
+    percent: Math.round(percent * 10) / 10,
+    nodeCount: nodeItems.length,
+  };
+}
+
+export async function watchClusterMemory(
+  onUpdate: (memory: ClusterMemory) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const kc = loadKubeConfig();
+  const watch = new k8s.Watch(kc);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      getClusterMemory()
+        .then(onUpdate)
+        .catch(() => undefined);
+    }, 200);
+  };
+  const controller = await watch.watch(
+    "/api/v1/pods",
+    {},
+    (phase) => {
+      if (phase === "ADDED" || phase === "MODIFIED" || phase === "DELETED") {
+        schedule();
+      }
+    },
+    () => undefined,
+  );
+  const abort = () => {
+    if (timer) clearTimeout(timer);
+    controller.abort();
+  };
+  if (signal.aborted) {
+    abort();
+    return;
+  }
+  signal.addEventListener("abort", abort, { once: true });
+}
+
 export async function getClusterInfo(): Promise<ClusterInfo> {
   let context = "unknown";
   let contexts: string[] = [];
@@ -163,6 +300,7 @@ export async function getClusterInfo(): Promise<ClusterInfo> {
       namespaces: ["default"],
       reachable: false,
       eckInstalled: false,
+      eck: emptyEckOperatorStatus(),
       error: getErrorMessage(err),
     };
   }
@@ -175,7 +313,13 @@ export async function getClusterInfo(): Promise<ClusterInfo> {
       .filter((n): n is string => Boolean(n))
       .sort();
 
-    const eckInstalled = await detectEckInstalled();
+    const eck = await getEckOperatorStatus();
+    let memory: ClusterMemory | undefined;
+    try {
+      memory = await getClusterMemory();
+    } catch {
+      memory = undefined;
+    }
 
     return {
       context,
@@ -183,7 +327,9 @@ export async function getClusterInfo(): Promise<ClusterInfo> {
       server,
       namespaces: namespaces.length > 0 ? namespaces : ["default"],
       reachable: true,
-      eckInstalled,
+      eckInstalled: eck.installed,
+      eck,
+      memory,
     };
   } catch (err) {
     return {
@@ -193,25 +339,9 @@ export async function getClusterInfo(): Promise<ClusterInfo> {
       namespaces: ["default"],
       reachable: false,
       eckInstalled: false,
+      eck: emptyEckOperatorStatus(),
       error: getErrorMessage(err),
     };
-  }
-}
-
-async function detectEckInstalled(): Promise<boolean> {
-  try {
-    const { kc } = clients();
-    const api = kc.makeApiClient(k8s.ApiextensionsV1Api) as {
-      readCustomResourceDefinition: (p: {
-        name: string;
-      }) => Promise<unknown>;
-    };
-    await api.readCustomResourceDefinition({
-      name: "elasticsearches.elasticsearch.k8s.elastic.co",
-    });
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -296,6 +426,98 @@ function memoryLimitForHeap(heap: string): string {
   return `${value % 1 === 0 ? value : value.toFixed(1)}${unit}`;
 }
 
+const JAVA_HEAP_RE = /-Xm[sx](\d+(?:\.\d+)?[mMgG])/i;
+
+function elasticsearchHeapContainer(heap: string): Record<string, unknown> {
+  const memory = memoryLimitForHeap(heap);
+  return {
+    name: "elasticsearch",
+    env: [
+      {
+        name: "ES_JAVA_OPTS",
+        value: `-Xms${heap} -Xmx${heap}`,
+      },
+    ],
+    resources: {
+      requests: { memory },
+      limits: { memory },
+    },
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function nodeSetsFromSpec(spec: Record<string, unknown>): Record<string, unknown>[] {
+  if (!Array.isArray(spec.nodeSets)) return [];
+  return spec.nodeSets
+    .map((item) => asRecord(item))
+    .filter((item): item is Record<string, unknown> => item !== null);
+}
+
+function defaultNodeSetIndex(nodeSets: Record<string, unknown>[]): number {
+  const named = nodeSets.findIndex((ns) => ns.name === "default");
+  return named >= 0 ? named : 0;
+}
+
+function extractHeapSizeFromNodeSet(
+  nodeSet: Record<string, unknown> | undefined,
+): string | undefined {
+  const podTemplate = asRecord(nodeSet?.podTemplate);
+  const spec = asRecord(podTemplate?.spec);
+  const containers = spec?.containers;
+  if (!Array.isArray(containers)) return undefined;
+  const esContainer =
+    containers.find((c) => asRecord(c)?.name === "elasticsearch") ??
+    containers[0];
+  const env = asRecord(esContainer)?.env;
+  if (!Array.isArray(env)) return undefined;
+  const javaOpts = env.find((entry) => asRecord(entry)?.name === "ES_JAVA_OPTS");
+  const value = asRecord(javaOpts)?.value;
+  if (typeof value !== "string") return undefined;
+  const match = JAVA_HEAP_RE.exec(value);
+  if (!match) return undefined;
+  try {
+    return normalizeHeapSize(match[1]);
+  } catch {
+    return undefined;
+  }
+}
+
+function applyHeapToNodeSet(
+  nodeSet: Record<string, unknown>,
+  heap: string | undefined,
+): Record<string, unknown> {
+  const next = { ...nodeSet };
+  if (!heap) {
+    delete next.podTemplate;
+    return next;
+  }
+  const existingPt = asRecord(nodeSet.podTemplate) ?? {};
+  const existingSpec = asRecord(existingPt.spec) ?? {};
+  const containers = Array.isArray(existingSpec.containers)
+    ? existingSpec.containers.map((c) => asRecord(c)).filter((c) => c !== null)
+    : [];
+  const heapContainer = elasticsearchHeapContainer(heap);
+  const idx = containers.findIndex((c) => c.name === "elasticsearch");
+  if (idx >= 0) {
+    containers[idx] = { ...containers[idx], ...heapContainer };
+  } else {
+    containers.push(heapContainer);
+  }
+  next.podTemplate = {
+    ...existingPt,
+    spec: {
+      ...existingSpec,
+      containers,
+    },
+  };
+  return next;
+}
+
 export function normalizeNodeCount(nodeCount?: number | null): number {
   if (nodeCount == null || Number.isNaN(nodeCount)) return 1;
   const n = Math.floor(Number(nodeCount));
@@ -324,24 +546,9 @@ function buildElasticsearchManifest(
 
   const heap = normalizeHeapSize(options.heapSize);
   if (heap) {
-    const memory = memoryLimitForHeap(heap);
     nodeSet.podTemplate = {
       spec: {
-        containers: [
-          {
-            name: "elasticsearch",
-            env: [
-              {
-                name: "ES_JAVA_OPTS",
-                value: `-Xms${heap} -Xmx${heap}`,
-              },
-            ],
-            resources: {
-              requests: { memory },
-              limits: { memory },
-            },
-          },
-        ],
+        containers: [elasticsearchHeapContainer(heap)],
       },
     };
   }
@@ -468,6 +675,180 @@ function extractLogstashConfigString(spec: Record<string, unknown>): string | nu
   if (typeof main !== "object" || main === null) return null;
   const config = (main as { "config.string"?: unknown })["config.string"];
   return typeof config === "string" ? config : null;
+}
+
+function httpError(message: string, statusCode: number): Error & {
+  statusCode: number;
+} {
+  const err = new Error(message) as Error & { statusCode: number };
+  err.statusCode = statusCode;
+  return err;
+}
+
+export async function patchCustomObjectVersion(params: {
+  group: string;
+  version: string;
+  namespace: string;
+  plural: string;
+  name: string;
+  stackVersion: string;
+  rejectDowngrade?: boolean;
+}): Promise<void> {
+  const { group, version, namespace, plural, name, stackVersion } = params;
+  const { custom } = clients();
+  let current: { spec?: { version?: unknown } };
+  try {
+    current = (await custom.getNamespacedCustomObject({
+      group,
+      version,
+      namespace,
+      plural,
+      name,
+    })) as { spec?: { version?: unknown } };
+  } catch (err) {
+    if (isNotFound(err)) {
+      throw httpError(
+        `${plural} "${name}" not found in namespace "${namespace}". Deploy it first.`,
+        404,
+      );
+    }
+    throw err;
+  }
+
+  const currentVersion =
+    typeof current.spec?.version === "string"
+      ? current.spec.version.trim()
+      : "";
+  if (
+    params.rejectDowngrade &&
+    currentVersion &&
+    compareVersions(stackVersion, currentVersion) < 0
+  ) {
+    throw httpError(
+      `Elasticsearch cannot be downgraded from ${currentVersion} to ${stackVersion}.`,
+      400,
+    );
+  }
+  if (currentVersion === stackVersion) return;
+
+  await custom.patchNamespacedCustomObject({
+    group,
+    version,
+    namespace,
+    plural,
+    name,
+    body: [
+      {
+        op: currentVersion ? "replace" : "add",
+        path: "/spec/version",
+        value: stackVersion,
+      },
+    ],
+  });
+}
+
+export async function upgradeElasticsearch(
+  namespace: string,
+  stackVersion: string,
+): Promise<void> {
+  await patchCustomObjectVersion({
+    group: ES_GROUP,
+    version: API_VERSION,
+    namespace,
+    plural: "elasticsearches",
+    name: RESOURCE_NAME,
+    stackVersion,
+    rejectDowngrade: true,
+  });
+}
+
+export async function updateElasticsearchTopology(
+  namespace: string,
+  options: {
+    nodeCount?: number;
+    heapSize?: string;
+    patchHeap?: boolean;
+  },
+): Promise<void> {
+  const { custom } = clients();
+  let current: { spec?: Record<string, unknown> };
+  try {
+    current = (await custom.getNamespacedCustomObject({
+      group: ES_GROUP,
+      version: API_VERSION,
+      namespace,
+      plural: "elasticsearches",
+      name: RESOURCE_NAME,
+    })) as { spec?: Record<string, unknown> };
+  } catch (err) {
+    if (isNotFound(err)) {
+      throw httpError(
+        `elasticsearches "${RESOURCE_NAME}" not found in namespace "${namespace}". Deploy it first.`,
+        404,
+      );
+    }
+    throw err;
+  }
+
+  const spec = asRecord(current.spec) ?? {};
+  const nodeSets = nodeSetsFromSpec(spec);
+  if (nodeSets.length === 0) {
+    throw httpError(
+      "Elasticsearch has no nodeSets to update.",
+      400,
+    );
+  }
+  const index = defaultNodeSetIndex(nodeSets);
+  let nodeSet = { ...nodeSets[index] };
+  if (options.nodeCount !== undefined) {
+    nodeSet = { ...nodeSet, count: normalizeNodeCount(options.nodeCount) };
+  }
+  if (options.patchHeap) {
+    nodeSet = applyHeapToNodeSet(nodeSet, options.heapSize);
+  }
+
+  await custom.patchNamespacedCustomObject({
+    group: ES_GROUP,
+    version: API_VERSION,
+    namespace,
+    plural: "elasticsearches",
+    name: RESOURCE_NAME,
+    body: [
+      {
+        op: "replace",
+        path: `/spec/nodeSets/${index}`,
+        value: nodeSet,
+      },
+    ],
+  });
+}
+
+export async function upgradeKibana(
+  namespace: string,
+  stackVersion: string,
+): Promise<void> {
+  await patchCustomObjectVersion({
+    group: KB_GROUP,
+    version: API_VERSION,
+    namespace,
+    plural: "kibanas",
+    name: RESOURCE_NAME,
+    stackVersion,
+  });
+}
+
+export async function upgradeLogstash(
+  namespace: string,
+  stackVersion: string,
+): Promise<void> {
+  await patchCustomObjectVersion({
+    group: LS_GROUP,
+    version: LS_API_VERSION,
+    namespace,
+    plural: "logstashes",
+    name: RESOURCE_NAME,
+    stackVersion,
+  });
 }
 
 export async function deployElasticsearch(
@@ -705,6 +1086,11 @@ export async function getElasticsearchStatus(
       namespace,
       "elasticsearch.k8s.elastic.co/cluster-name=quickstart",
     );
+    const nodeSets = nodeSetsFromSpec(spec);
+    const nodeSet =
+      nodeSets[defaultNodeSetIndex(nodeSets)] ?? nodeSets[0];
+    const count =
+      typeof nodeSet?.count === "number" ? nodeSet.count : undefined;
 
     return withTerminatingHealth({
       name: RESOURCE_NAME,
@@ -716,6 +1102,8 @@ export async function getElasticsearchStatus(
         typeof status.availableNodes === "number"
           ? status.availableNodes
           : undefined,
+      count,
+      heapSize: extractHeapSizeFromNodeSet(nodeSet),
       pods,
     });
   } catch (err) {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   EuiBadge,
   EuiButton,
@@ -34,6 +34,8 @@ import {
   getCluster,
   getCredentials,
   getEckLicense,
+  getEckOperator,
+  getEckOperatorVersions,
   getElasticAgent,
   getElasticsearch,
   getFleetExamples,
@@ -42,14 +44,25 @@ import {
   getLogstash,
   getPodLogs,
   getPortForwards,
+  getStackVersions,
+  installEckOperator,
   setClusterContext,
   startEckTrialLicense,
   startPortForward,
+  uninstallEckOperator,
+  upgradeAllQuickstart,
+  updateElasticsearchTopology,
+  upgradeElasticsearch,
+  upgradeFleetServer,
+  upgradeKibana,
+  upgradeLogstash,
   // findPortForwardState,
   // stopPortForward,
   type ClusterInfo,
+  type ClusterMemory,
   type Credentials,
   type EckLicenseStatus,
+  type EckOperatorStatus,
   type FleetExampleMeta,
   type PortForwardState,
   type PortForwardStatus,
@@ -161,10 +174,231 @@ function k8sStatusBadge(cluster: ClusterInfo | null): {
   if (!cluster.reachable) {
     return { label: "Unreachable", className: "unhealthy" };
   }
-  if (!cluster.eckInstalled) {
-    return { label: "No ECK", className: "pending" };
-  }
   return { label: "Connected", className: "healthy" };
+}
+
+function formatGiBytes(bytes: number): string {
+  const gi = bytes / 1024 ** 3;
+  if (!Number.isFinite(gi) || gi <= 0) return "0 Gi";
+  const digits = gi >= 10 ? 1 : 2;
+  return `${gi.toFixed(digits)} Gi`;
+}
+
+function memoryPressureStatus(
+  percent: number,
+): "normal" | "high" | "critical" {
+  if (percent >= 90) return "critical";
+  if (percent >= 75) return "high";
+  return "normal";
+}
+
+type PendingConfirm = {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  danger?: boolean;
+  busyKey: string;
+  action: () => Promise<string | void>;
+};
+
+function ConfirmDialog({
+  pending,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  pending: PendingConfirm;
+  busy: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !busy) onCancel();
+      }}
+    >
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-modal-title"
+      >
+        <h2 id="confirm-modal-title">{pending.title}</h2>
+        <p className="hint">{pending.body}</p>
+        <div className="modal-actions">
+          <button type="button" disabled={Boolean(busy)} onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className={pending.danger ? "danger" : "primary"}
+            disabled={Boolean(busy)}
+            onClick={onConfirm}
+          >
+            {pending.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RamMeter({ memory }: { memory?: ClusterMemory }) {
+  if (!memory || memory.nodeCount === 0) return null;
+  const status = memoryPressureStatus(memory.percent);
+  const label =
+    status === "normal" ? "Normal" : status === "high" ? "High" : "Critical";
+  const pct = Math.max(0, Math.min(100, Math.round(memory.percent)));
+  const title = `${formatGiBytes(memory.requestBytes)} requested of ${formatGiBytes(memory.allocatableBytes)} allocatable (${formatGiBytes(memory.remainingBytes)} free to schedule)`;
+  return (
+    <div
+      className={`ram-meter ram-meter-${status}`}
+      title={title}
+      aria-label={`Memory requests ${label} ${pct} percent`}
+    >
+      <div className="ram-meter-label">Memory requests</div>
+      <div className="ram-meter-row">
+        <span className="ram-meter-status">{label}</span>
+        <div className="ram-meter-track" aria-hidden="true">
+          <div className="ram-meter-fill" style={{ width: `${pct}%` }} />
+        </div>
+        <span className="ram-meter-pct">{pct}%</span>
+      </div>
+    </div>
+  );
+}
+
+function eckStatusBadge(cluster: ClusterInfo | null): {
+  label: string;
+  className: string;
+} {
+  const eck = cluster?.eck;
+  if (!cluster) {
+    return { label: "Checking…", className: "pending" };
+  }
+  if (!cluster.reachable) {
+    return { label: "Unavailable", className: "unhealthy" };
+  }
+  if (!eck || eck.phase === "not_installed") {
+    return { label: "Not installed", className: "pending" };
+  }
+  if (eck.phase === "running" && eck.ready) {
+    return { label: eck.version ? `Running ${eck.version}` : "Running", className: "healthy" };
+  }
+  if (eck.phase === "installing") {
+    return { label: "Starting", className: "pending" };
+  }
+  return { label: "Unhealthy", className: "unhealthy" };
+}
+
+function compareVersions(a: string, b: string): number {
+  const parse = (v: string) =>
+    v
+      .replace(/^v/i, "")
+      .split("-")[0]
+      .split(".")
+      .map((n) => parseInt(n, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+function stackVersionAction(exists: boolean, current: string | undefined, desired: string) {
+  if (!exists) return { label: "Deploy", kind: "deploy" as const };
+  if (!current || current === desired) {
+    return { label: "Deploy", kind: "deploy" as const };
+  }
+  if (compareVersions(desired, current) > 0) {
+    return { label: `Upgrade to ${desired}`, kind: "upgrade" as const };
+  }
+  return { label: `Change version to ${desired}`, kind: "downgrade" as const };
+}
+
+function eckPrimaryAction(eck: EckOperatorStatus | undefined, selected: string) {
+  if (!selected) {
+    return { label: "Install", kind: "install" as const };
+  }
+  if (!eck || eck.phase === "not_installed") {
+    return { label: `Install ${selected}`, kind: "install" as const };
+  }
+  const current = eck.version;
+  if (!current) {
+    return { label: `Install ${selected}`, kind: "install" as const };
+  }
+  if (current === selected) {
+    return {
+      label: eck.ready ? `Reapply ${selected}` : `Reinstall ${selected}`,
+      kind: "install" as const,
+    };
+  }
+  if (compareVersions(selected, current) > 0) {
+    return { label: `Upgrade to ${selected}`, kind: "upgrade" as const };
+  }
+  return { label: `Switch to ${selected}`, kind: "switch" as const };
+}
+
+function VersionPicker({
+  id,
+  listedLabel,
+  customLabel,
+  versions,
+  value,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  listedLabel: string;
+  customLabel: string;
+  versions: string[];
+  value: string;
+  onChange: (next: string) => void;
+  disabled?: boolean;
+}) {
+  const inList = versions.includes(value);
+  return (
+    <>
+      <div className="summary-item">
+        <label htmlFor={id}>{listedLabel}</label>
+        <select
+          id={id}
+          value={inList ? value : "__custom__"}
+          disabled={disabled}
+          onChange={(e) => {
+            const next = e.target.value;
+            if (next !== "__custom__") onChange(next);
+          }}
+        >
+          {versions.map((v) => (
+            <option key={v} value={v}>
+              {v}
+            </option>
+          ))}
+          {!inList && value ? (
+            <option value="__custom__">Custom ({value})</option>
+          ) : null}
+        </select>
+      </div>
+      <div className="summary-item">
+        <label htmlFor={`${id}-custom`}>{customLabel}</label>
+        <input
+          id={`${id}-custom`}
+          value={value}
+          onChange={(e) => onChange(e.target.value.trim())}
+          placeholder="Not in the list? Type it here"
+          spellCheck={false}
+          disabled={disabled}
+        />
+      </div>
+    </>
+  );
 }
 
 type StackTarget = "es" | "kb" | "ls" | "fleet" | "agent" | "all";
@@ -184,6 +418,7 @@ export default function App() {
   const [cluster, setCluster] = useState<ClusterInfo | null>(null);
   const [namespace, setNamespace] = useState("default");
   const [version, setVersion] = useState("9.5.0");
+  const [stackVersions, setStackVersions] = useState<string[]>(["9.5.0"]);
   const [es, setEs] = useState<ResourceStatus>(emptyStatus());
   const [kb, setKb] = useState<ResourceStatus>(emptyStatus());
   const [ls, setLs] = useState<ResourceStatus>(emptyStatus());
@@ -193,6 +428,13 @@ export default function App() {
   const [creds, setCreds] = useState<Credentials | null>(null);
   const [eckLicense, setEckLicense] = useState<EckLicenseStatus | null>(null);
   const [trialModalOpen, setTrialModalOpen] = useState(false);
+  const [eckOpen, setEckOpen] = useState(false);
+  const [eckAutoOpened, setEckAutoOpened] = useState(false);
+  const [eckOperatorVersion, setEckOperatorVersion] = useState("3.5.0");
+  const [eckVersions, setEckVersions] = useState<string[]>(["3.5.0"]);
+  const [eckApplyOpen, setEckApplyOpen] = useState(false);
+  const [eckUninstallOpen, setEckUninstallOpen] = useState(false);
+  const [eckDeleteCrds, setEckDeleteCrds] = useState(false);
   const [portForwards, setPortForwards] = useState<PortForwardStatus>({
     es: emptyPortForward("es", 9200, "quickstart-es-http"),
     kibana: emptyPortForward("kibana", 5601, "quickstart-kb-http"),
@@ -209,11 +451,15 @@ export default function App() {
   const [logstashConfig, setLogstashConfig] = useState(DEFAULT_LOGSTASH_CONFIG);
   const [destroyModalOpen, setDestroyModalOpen] = useState(false);
   const [deleteNsModalOpen, setDeleteNsModalOpen] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(
+    null,
+  );
   const [newNamespace, setNewNamespace] = useState("");
   const [includeLogstash, setIncludeLogstash] = useState(true);
   const [heapSize, setHeapSize] = useState("");
   const [lsHeapSize, setLsHeapSize] = useState("");
   const [nodeCount, setNodeCount] = useState(1);
+  const esTopologyDirty = useRef(false);
   const [fleetExamples, setFleetExamples] = useState<FleetExampleMeta[]>([]);
   const [selectedExample, setSelectedExample] = useState("quickstart");
   const [logsModal, setLogsModal] = useState<{
@@ -245,6 +491,8 @@ export default function App() {
       credentials,
       pfStatus,
       license,
+      operator,
+      clusterInfo,
     ] = await Promise.all([
       getElasticsearch(ns),
       getKibana(ns),
@@ -254,6 +502,8 @@ export default function App() {
       getCredentials(ns),
       getPortForwards(),
       getEckLicense().catch(() => null),
+      getEckOperator().catch(() => null),
+      getCluster().catch(() => null),
     ]);
     setEs(esStatus);
     setKb(kbStatus);
@@ -263,19 +513,48 @@ export default function App() {
     setCreds(credentials);
     setPortForwards(pfStatus);
     setEckLicense(license);
+    if (!esTopologyDirty.current && esStatus.exists) {
+      if (typeof esStatus.count === "number") setNodeCount(esStatus.count);
+      setHeapSize(esStatus.heapSize ?? "");
+    }
+    if (clusterInfo) {
+      setCluster(clusterInfo);
+    } else if (operator) {
+      setCluster((prev) =>
+        prev
+          ? { ...prev, eck: operator, eckInstalled: operator.installed }
+          : prev,
+      );
+    }
   }
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [info, examples] = await Promise.all([
-          getCluster(),
-          getFleetExamples(),
-        ]);
+        const [info, examples, operatorVersions, stackVersionList] =
+          await Promise.all([
+            getCluster(),
+            getFleetExamples(),
+            getEckOperatorVersions().catch(() => null),
+            getStackVersions().catch(() => null),
+          ]);
         if (cancelled) return;
         setCluster(info);
-        setVersion(info.defaultVersion);
+        if (stackVersionList) {
+          setStackVersions(stackVersionList.versions);
+          setVersion(stackVersionList.defaultVersion);
+        } else {
+          setVersion(info.defaultVersion);
+        }
+        if (operatorVersions) {
+          setEckVersions(operatorVersions.versions);
+          setEckOperatorVersion(
+            info.eck?.version || operatorVersions.defaultVersion,
+          );
+        } else if (info.eck?.version) {
+          setEckOperatorVersion(info.eck.version);
+        }
         setFleetExamples(examples.examples);
         if (examples.examples.length > 0) {
           const preferred =
@@ -307,7 +586,31 @@ export default function App() {
     }, 5000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cluster, namespace]);
+  }, [cluster?.reachable, namespace]);
+
+  useEffect(() => {
+    if (!cluster?.reachable) return;
+    const source = new EventSource("/api/cluster/memory");
+    source.onmessage = (event) => {
+      try {
+        const memory = JSON.parse(event.data) as ClusterMemory;
+        setCluster((prev) => (prev ? { ...prev, memory } : prev));
+      } catch {
+        // Ignore malformed snapshots.
+      }
+    };
+    return () => {
+      source.close();
+    };
+  }, [cluster?.reachable, cluster?.context]);
+
+  useEffect(() => {
+    if (eckAutoOpened || !cluster?.reachable) return;
+    if (!cluster.eck?.ready) {
+      setEckOpen(true);
+      setEckAutoOpened(true);
+    }
+  }, [cluster, eckAutoOpened]);
 
   async function run(
     label: string,
@@ -323,6 +626,10 @@ export default function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  function confirmRun(spec: PendingConfirm) {
+    setPendingConfirm(spec);
   }
 
   async function runPortForward(label: string, action: () => Promise<void>) {
@@ -399,6 +706,54 @@ export default function App() {
     (e) => e.id === selectedExample,
   );
   const k8sBadge = k8sStatusBadge(cluster);
+  const eckBadge = eckStatusBadge(cluster);
+  const operatorReady = Boolean(cluster?.reachable && cluster.eck?.ready);
+  const operatorNotReadyReason = !cluster?.reachable
+    ? "Kubernetes cluster is unreachable"
+    : !cluster?.eck?.ready
+      ? "Install a healthy ECK operator first"
+      : undefined;
+  const eckAction = eckPrimaryAction(cluster?.eck, eckOperatorVersion);
+  const stackWouldDowngrade = [
+    es.version,
+    kb.version,
+    ls.version,
+    fleetServer.version,
+    elasticAgent.version,
+  ].some((current) => current && compareVersions(version, current) < 0);
+  const esAction = stackVersionAction(es.exists, es.version, version);
+  const esHeapValid = !heapSize || /^\d+(?:\.\d+)?[mMgG]$/.test(heapSize);
+  const esCountValid =
+    Number.isInteger(nodeCount) && nodeCount >= 1 && nodeCount <= 9;
+  const esTopologyChanged =
+    es.exists &&
+    (nodeCount !== (es.count ?? es.nodes) ||
+      heapSize !== (es.heapSize ?? ""));
+  const kbAction = stackVersionAction(kb.exists, kb.version, version);
+  const lsAction = stackVersionAction(ls.exists, ls.version, version);
+  const fleetAction = stackVersionAction(
+    fleetServer.exists,
+    fleetServer.version,
+    version,
+  );
+  const stackVersionOptions = [
+    ...new Set(
+      [
+        ...stackVersions,
+        version,
+        es.version,
+        kb.version,
+        ls.version,
+        fleetServer.version,
+        elasticAgent.version,
+      ].filter((v): v is string => Boolean(v)),
+    ),
+  ].sort((a, b) => compareVersions(b, a));
+  const allAction = !hasInstances
+    ? { label: "Deploy all", kind: "deploy" as const }
+    : stackWouldDowngrade
+      ? { label: `Change version to ${version}`, kind: "downgrade" as const }
+      : { label: `Upgrade all to ${version}`, kind: "upgrade" as const };
 
   function toggleStackTarget(target: StackTarget) {
     setStackTarget((current) => (current === target ? null : target));
@@ -552,6 +907,7 @@ export default function App() {
             </h2>
             <span className="chevron">{k8sOpen ? "▾" : "▸"}</span>
           </button>
+          <RamMeter memory={cluster?.memory} />
           {k8sOpen ? (
             <div className="panel-body">
               <div className="summary-grid">
@@ -563,14 +919,21 @@ export default function App() {
                     disabled={Boolean(busy) || !cluster}
                     onChange={(e) => {
                       const next = e.target.value;
-                      run("context-switch", async () => {
-                        const info = await setClusterContext(next);
-                        setCluster(info);
-                        const ns = info.namespaces.includes("default")
-                          ? "default"
-                          : info.namespaces[0] || "default";
-                        setNamespace(ns);
-                        return ns;
+                      if (!next || next === cluster?.context) return;
+                      confirmRun({
+                        title: `Switch kube context to ${next}?`,
+                        body: "This switches the in-app kube context and stops active port-forwards.",
+                        confirmLabel: "Switch context",
+                        busyKey: "context-switch",
+                        action: async () => {
+                          const info = await setClusterContext(next);
+                          setCluster(info);
+                          const ns = info.namespaces.includes("default")
+                            ? "default"
+                            : info.namespaces[0] || "default";
+                          setNamespace(ns);
+                          return ns;
+                        },
                       });
                     }}
                   >
@@ -595,6 +958,7 @@ export default function App() {
                       value={namespace}
                       onChange={(e) => {
                         const ns = e.target.value;
+                        esTopologyDirty.current = false;
                         setNamespace(ns);
                         refreshAll(ns).catch((err) =>
                           setError(
@@ -639,14 +1003,20 @@ export default function App() {
                       type="button"
                       disabled={Boolean(busy) || !newNamespace.trim()}
                       onClick={() =>
-                        run("ns-create", async () => {
-                          const result = await createNamespace(
-                            newNamespace.trim(),
-                          );
-                          setCluster(result);
-                          setNamespace(result.name);
-                          setNewNamespace("");
-                          return result.name;
+                        confirmRun({
+                          title: `Create namespace ${newNamespace.trim()}?`,
+                          body: "This creates a Kubernetes namespace and switches the UI to it.",
+                          confirmLabel: "Create namespace",
+                          busyKey: "ns-create",
+                          action: async () => {
+                            const result = await createNamespace(
+                              newNamespace.trim(),
+                            );
+                            setCluster(result);
+                            setNamespace(result.name);
+                            setNewNamespace("");
+                            return result.name;
+                          },
                         })
                       }
                     >
@@ -654,13 +1024,72 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+              </div>
+            </div>
+          ) : null}
+        </section>
+
+        <section className="panel">
+          <button
+            type="button"
+            className="panel-toggle"
+            aria-expanded={eckOpen}
+            onClick={() => setEckOpen((open) => !open)}
+          >
+            <h2 className="panel-title">
+              ECK
+              <span
+                className={`badge k8s-status-badge ${eckBadge.className}`}
+                title={cluster?.eck?.message || undefined}
+              >
+                {eckBadge.label}
+              </span>
+            </h2>
+            <span className="chevron">{eckOpen ? "▾" : "▸"}</span>
+          </button>
+          {eckOpen ? (
+            <div className="panel-body">
+              <p className="hint panel-hint">
+                The operator runs in <code>elastic-system</code>. Stack
+                workloads stay in the selected namespace. Installing or
+                upgrading the operator can rolling-restart managed pods.
+              </p>
+              <div className="summary-grid">
+                <div className="summary-item">
+                  <label>Context</label>
+                  <div className="value mono-value">
+                    {cluster?.context || "—"}
+                  </div>
+                </div>
+                <div className="summary-item">
+                  <label>Namespace</label>
+                  <div className="value mono-value">{namespace}</div>
+                </div>
+                <div className="summary-item">
+                  <label>Installed version</label>
+                  <div className="value">
+                    {cluster?.eck?.version || "—"}
+                    {cluster?.eck?.podName ? (
+                      <span className="hint"> — {cluster.eck.podName}</span>
+                    ) : null}
+                  </div>
+                </div>
+                <VersionPicker
+                  id="eck-operator-version"
+                  listedLabel="Available versions"
+                  customLabel="Custom version"
+                  versions={eckVersions}
+                  value={eckOperatorVersion}
+                  onChange={setEckOperatorVersion}
+                  disabled={Boolean(busy) || !cluster?.reachable}
+                />
                 <div className="summary-item summary-item-wide">
                   <label>ECK license</label>
                   <div className="namespace-row">
                     <div className="value">
                       {eckLicense?.level
                         ? eckLicense.level
-                        : cluster?.eckInstalled
+                        : cluster?.eck?.installed
                           ? "loading…"
                           : "n/a"}
                       {eckLicense?.message ? (
@@ -672,12 +1101,12 @@ export default function App() {
                       className="primary"
                       disabled={
                         Boolean(busy) ||
-                        !cluster?.eckInstalled ||
+                        !cluster?.eck?.ready ||
                         !eckLicense?.canStartTrial
                       }
                       title={
-                        !cluster?.eckInstalled
-                          ? "ECK operator not detected"
+                        !cluster?.eck?.ready
+                          ? "ECK operator is not running"
                           : !eckLicense?.canStartTrial
                             ? eckLicense?.message ||
                               "Trial unavailable for this cluster"
@@ -689,6 +1118,43 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+              </div>
+              {cluster?.eck?.message ? (
+                <p className="hint panel-hint">{cluster.eck.message}</p>
+              ) : null}
+              <div className="deploy-actions">
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={
+                    Boolean(busy) ||
+                    !cluster?.reachable ||
+                    !eckOperatorVersion
+                  }
+                  onClick={() => setEckApplyOpen(true)}
+                >
+                  {eckAction.label}
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={
+                    Boolean(busy) ||
+                    !cluster?.reachable ||
+                    !(
+                      cluster?.eck?.installed ||
+                      cluster?.eck?.version ||
+                      cluster?.eck?.podName
+                    )
+                  }
+                  title="Remove the operator. Optionally delete CRDs (destroys all Elastic resources cluster-wide)."
+                  onClick={() => {
+                    setEckDeleteCrds(false);
+                    setEckUninstallOpen(true);
+                  }}
+                >
+                  Uninstall
+                </button>
               </div>
             </div>
           ) : null}
@@ -711,17 +1177,48 @@ export default function App() {
                   <label>Deployment name</label>
                   <div className="value">quickstart</div>
                 </div>
-                <div className="summary-item">
-                  <label htmlFor="version">Deployment version</label>
-                  <input
-                    id="version"
-                    value={version}
-                    onChange={(e) => setVersion(e.target.value.trim())}
-                    placeholder="9.5.0"
-                    spellCheck={false}
-                  />
-                </div>
+                <VersionPicker
+                  id="version"
+                  listedLabel="Available versions"
+                  customLabel="Custom version"
+                  versions={stackVersionOptions}
+                  value={version}
+                  onChange={setVersion}
+                  disabled={Boolean(busy)}
+                />
               </div>
+              {!operatorReady ? (
+                <p className="hint panel-hint">
+                  {operatorNotReadyReason ||
+                    "Install a healthy ECK operator first"}
+                  . Open the ECK box to install or repair the operator.
+                </p>
+              ) : null}
+              {operatorReady && stackWouldDowngrade ? (
+                <p className="hint panel-hint">
+                  The typed stack version is lower than a running component.
+                  Elasticsearch data directories generally cannot downgrade.
+                </p>
+              ) : null}
+              {operatorReady && cluster?.eck?.version ? (
+                <p className="hint panel-hint">
+                  ECK operator {cluster.eck.version} must be compatible with
+                  stack {version}. Upgrade the operator in the ECK box first if
+                  it is too old.
+                </p>
+              ) : null}
+              {operatorReady ? (
+                <p className="hint panel-hint">
+                  Upgrade patches only <code>spec.version</code>. Use Apply
+                  heap &amp; nodes to change JVM heap or node count without
+                  replacing the cluster. ECK rolling-upgrades Elasticsearch one
+                  node at a time only with at least 3 master-eligible nodes.
+                  With 1 or 2 nodes a version upgrade restarts the whole
+                  cluster at once (no quorum). Heap changes still roll one pod
+                  at a time. Scaling down deletes removed nodes&apos; data
+                  volumes.
+                </p>
+              ) : null}
 
               <div className="stack-targets">
                 <div className="stack-target">
@@ -731,7 +1228,12 @@ export default function App() {
                     aria-expanded={stackTarget === "es"}
                     onClick={() => toggleStackTarget("es")}
                   >
-                    <h3 className="subsection-title">Elasticsearch</h3>
+                    <h3 className="subsection-title">
+                      Elasticsearch
+                      {es.exists && es.version ? (
+                        <span className="subsection-version">v{es.version}</span>
+                      ) : null}
+                    </h3>
                     <span className="chevron">
                       {stackTarget === "es" ? "▾" : "▸"}
                     </span>
@@ -744,10 +1246,13 @@ export default function App() {
                           <input
                             id="heap-size"
                             value={heapSize}
-                            onChange={(e) => setHeapSize(e.target.value.trim())}
+                            onChange={(e) => {
+                              esTopologyDirty.current = true;
+                              setHeapSize(e.target.value.trim());
+                            }}
                             placeholder="2g"
                             spellCheck={false}
-                            title="Optional JVM heap (e.g. 512m, 1g, 2g). Pod memory is 2× heap."
+                            title="Optional JVM heap (e.g. 512m, 1g, 2g). Pod memory is 2× heap. Blank uses the image default."
                           />
                         </div>
                         <div className="summary-item">
@@ -760,27 +1265,109 @@ export default function App() {
                             value={nodeCount}
                             onChange={(e) => {
                               const n = Number(e.target.value);
-                              if (Number.isFinite(n)) setNodeCount(n);
+                              if (Number.isFinite(n)) {
+                                esTopologyDirty.current = true;
+                                setNodeCount(n);
+                              }
                             }}
-                            title="nodeSets count (1–9)"
+                            title="nodeSets count (1–9). Use 3+ for rolling version upgrades."
                           />
                         </div>
                       </div>
                       <div className="deploy-actions">
                         <button
                           className="primary"
-                          disabled={Boolean(busy) || !version}
+                          disabled={
+                            Boolean(busy) ||
+                            !version ||
+                            !operatorReady ||
+                            esAction.kind === "downgrade"
+                          }
+                          title={
+                            !operatorReady
+                              ? operatorNotReadyReason
+                              : esAction.kind === "downgrade"
+                                ? "Elasticsearch generally cannot downgrade an existing data directory"
+                                : undefined
+                          }
                           onClick={() =>
-                            run("es-deploy", async () => {
-                              await deployElasticsearch(namespace, version, {
-                                heapSize: heapSize || undefined,
-                                nodeCount,
-                              });
+                            confirmRun({
+                              title: es.exists
+                                ? `Upgrade Elasticsearch to ${version}?`
+                                : `Deploy Elasticsearch ${version}?`,
+                              body: es.exists
+                                ? `This patches spec.version on quickstart in ${namespace} from ${es.version || "unknown"} to ${version}. Heap and node count stay as they are.`
+                                : `This creates Elasticsearch quickstart in ${namespace} with ${nodeCount} node${nodeCount === 1 ? "" : "s"}${heapSize ? ` and heap ${heapSize}` : ""}.`,
+                              confirmLabel: esAction.label,
+                              busyKey: "es-deploy",
+                              action: async () => {
+                                if (es.exists) {
+                                  await upgradeElasticsearch(
+                                    namespace,
+                                    version,
+                                  );
+                                  return;
+                                }
+                                await deployElasticsearch(namespace, version, {
+                                  heapSize: heapSize || undefined,
+                                  nodeCount,
+                                });
+                              },
                             })
                           }
                         >
-                          Deploy
+                          {esAction.label}
                         </button>
+                        {es.exists ? (
+                          <button
+                            type="button"
+                            className="ghost"
+                            disabled={
+                              Boolean(busy) ||
+                              !operatorReady ||
+                              !esTopologyChanged ||
+                              !esHeapValid ||
+                              !esCountValid
+                            }
+                            title={
+                              !operatorReady
+                                ? operatorNotReadyReason
+                                : !esCountValid
+                                  ? "Node count must be between 1 and 9"
+                                  : !esHeapValid
+                                    ? 'Heap must look like "512m", "1g", or "2g"'
+                                    : !esTopologyChanged
+                                      ? "Heap and node count already match the cluster"
+                                      : es.count != null &&
+                                          nodeCount < es.count
+                                        ? "Scaling down deletes removed nodes' data volumes"
+                                        : "Patch node count and heap without changing version"
+                            }
+                            onClick={() =>
+                              confirmRun({
+                                title: "Apply Elasticsearch heap and nodes?",
+                                body:
+                                  es.count != null && nodeCount < es.count
+                                    ? `This sets ${nodeCount} node${nodeCount === 1 ? "" : "s"} and heap ${heapSize || "(image default)"} on quickstart in ${namespace}. Scaling down deletes removed nodes' data volumes.`
+                                    : `This sets ${nodeCount} node${nodeCount === 1 ? "" : "s"} and heap ${heapSize || "(image default)"} on quickstart in ${namespace}. Version is not changed.`,
+                                confirmLabel: "Apply heap & nodes",
+                                busyKey: "es-topology",
+                                action: async () => {
+                                  await updateElasticsearchTopology(
+                                    namespace,
+                                    {
+                                      heapSize,
+                                      nodeCount,
+                                    },
+                                  );
+                                  esTopologyDirty.current = false;
+                                },
+                              })
+                            }
+                          >
+                            Apply heap & nodes
+                          </button>
+                        ) : null}
                       </div>
                     </div>
                   ) : null}
@@ -793,7 +1380,12 @@ export default function App() {
                     aria-expanded={stackTarget === "kb"}
                     onClick={() => toggleStackTarget("kb")}
                   >
-                    <h3 className="subsection-title">Kibana</h3>
+                    <h3 className="subsection-title">
+                      Kibana
+                      {kb.exists && kb.version ? (
+                        <span className="subsection-version">v{kb.version}</span>
+                      ) : null}
+                    </h3>
                     <span className="chevron">
                       {stackTarget === "kb" ? "▾" : "▸"}
                     </span>
@@ -806,17 +1398,40 @@ export default function App() {
                       <div className="deploy-actions">
                         <button
                           className="primary"
-                          disabled={Boolean(busy) || !es.exists || !version}
+                          disabled={
+                            Boolean(busy) ||
+                            !es.exists ||
+                            !version ||
+                            !operatorReady
+                          }
                           title={
-                            !es.exists ? "Deploy Elasticsearch first" : undefined
+                            !operatorReady
+                              ? operatorNotReadyReason
+                              : !es.exists
+                                ? "Deploy Elasticsearch first"
+                                : undefined
                           }
                           onClick={() =>
-                            run("kb-deploy", async () => {
-                              await deployKibana(namespace, version);
+                            confirmRun({
+                              title: kb.exists
+                                ? `Upgrade Kibana to ${version}?`
+                                : `Deploy Kibana ${version}?`,
+                              body: kb.exists
+                                ? `This patches spec.version on Kibana quickstart in ${namespace} from ${kb.version || "unknown"} to ${version}.`
+                                : `This creates Kibana quickstart in ${namespace} against Elasticsearch.`,
+                              confirmLabel: kbAction.label,
+                              busyKey: "kb-deploy",
+                              action: async () => {
+                                if (kb.exists) {
+                                  await upgradeKibana(namespace, version);
+                                  return;
+                                }
+                                await deployKibana(namespace, version);
+                              },
                             })
                           }
                         >
-                          Deploy
+                          {kbAction.label}
                         </button>
                       </div>
                     </div>
@@ -837,13 +1452,24 @@ export default function App() {
                       toggleStackTarget("ls");
                     }}
                   >
-                    <h3 className="subsection-title">Logstash</h3>
+                    <h3 className="subsection-title">
+                      Logstash
+                      {ls.exists && ls.version ? (
+                        <span className="subsection-version">v{ls.version}</span>
+                      ) : null}
+                    </h3>
                     <span className="chevron">
                       {stackTarget === "ls" ? "▾" : "▸"}
                     </span>
                   </button>
                   {stackTarget === "ls" ? (
                     <div className="stack-target-body">
+                      <p className="hint panel-hint">
+                        Uses the version selected at the top of Stack. Upgrade
+                        patches only <code>spec.version</code> and keeps the
+                        current pipeline. Deploy (first time) applies the
+                        pipeline and heap from this form.
+                      </p>
                       <div className="summary-grid">
                         <div className="summary-item">
                           <label htmlFor="ls-heap-size">LS heap</label>
@@ -873,25 +1499,43 @@ export default function App() {
                             Boolean(busy) ||
                             !es.exists ||
                             !version ||
-                            !logstashConfig.trim()
+                            !operatorReady ||
+                            (!ls.exists && !logstashConfig.trim())
                           }
                           title={
-                            !es.exists
-                              ? "Deploy Elasticsearch first"
-                              : undefined
+                            !operatorReady
+                              ? operatorNotReadyReason
+                              : !es.exists
+                                ? "Deploy Elasticsearch first"
+                                : undefined
                           }
                           onClick={() =>
-                            run("ls-deploy", async () => {
-                              await deployLogstash(
-                                namespace,
-                                version,
-                                logstashConfig,
-                                { heapSize: lsHeapSize || undefined },
-                              );
+                            confirmRun({
+                              title: ls.exists
+                                ? `Upgrade Logstash to ${version}?`
+                                : `Deploy Logstash ${version}?`,
+                              body: ls.exists
+                                ? `This patches spec.version on Logstash quickstart in ${namespace} from ${ls.version || "unknown"} to ${version}. The current pipeline is kept.`
+                                : `This creates Logstash quickstart in ${namespace}${lsHeapSize ? ` with heap ${lsHeapSize}` : ""}.`,
+                              confirmLabel: lsAction.label,
+                              busyKey: "ls-deploy",
+                              action: async () => {
+                                if (ls.exists) {
+                                  await upgradeLogstash(namespace, version);
+                                  return;
+                                }
+                                await deployLogstash(
+                                  namespace,
+                                  version,
+                                  logstashConfig.trim() ||
+                                    DEFAULT_LOGSTASH_CONFIG,
+                                  { heapSize: lsHeapSize || undefined },
+                                );
+                              },
                             })
                           }
                         >
-                          Deploy
+                          {lsAction.label}
                         </button>
                       </div>
                     </div>
@@ -905,7 +1549,14 @@ export default function App() {
                     aria-expanded={stackTarget === "fleet"}
                     onClick={() => toggleStackTarget("fleet")}
                   >
-                    <h3 className="subsection-title">Fleet</h3>
+                    <h3 className="subsection-title">
+                      Fleet
+                      {fleetServer.exists && fleetServer.version ? (
+                        <span className="subsection-version">
+                          v{fleetServer.version}
+                        </span>
+                      ) : null}
+                    </h3>
                     <span className="chevron">
                       {stackTarget === "fleet" ? "▾" : "▸"}
                     </span>
@@ -919,19 +1570,48 @@ export default function App() {
                       <div className="deploy-actions">
                         <button
                           className="primary"
-                          disabled={Boolean(busy) || !es.exists || !version}
+                          disabled={
+                            Boolean(busy) ||
+                            !es.exists ||
+                            !version ||
+                            !operatorReady
+                          }
                           title={
-                            !es.exists
-                              ? "Deploy Elasticsearch first"
-                              : undefined
+                            !operatorReady
+                              ? operatorNotReadyReason
+                              : !es.exists
+                                ? "Deploy Elasticsearch first"
+                                : undefined
                           }
                           onClick={() =>
-                            run("fleet-deploy", async () => {
-                              await deployFleetServer(namespace, version);
+                            confirmRun({
+                              title: fleetServer.exists
+                                ? `Upgrade Fleet Server to ${version}?`
+                                : `Deploy Fleet Server ${version}?`,
+                              body: fleetServer.exists
+                                ? `This patches spec.version on Fleet Server in ${namespace} from ${fleetServer.version || "unknown"} to ${version}.`
+                                : `This deploys Fleet Server in ${namespace} (Kibana Fleet config + Agent CR).`,
+                              confirmLabel:
+                                fleetAction.kind === "deploy"
+                                  ? "Deploy Fleet"
+                                  : fleetAction.label,
+                              busyKey: "fleet-deploy",
+                              action: async () => {
+                                if (fleetServer.exists) {
+                                  await upgradeFleetServer(
+                                    namespace,
+                                    version,
+                                  );
+                                  return;
+                                }
+                                await deployFleetServer(namespace, version);
+                              },
                             })
                           }
                         >
-                          Deploy Fleet
+                          {fleetAction.kind === "deploy"
+                            ? "Deploy Fleet"
+                            : fleetAction.label}
                         </button>
                       </div>
                     </div>
@@ -945,7 +1625,14 @@ export default function App() {
                     aria-expanded={stackTarget === "agent"}
                     onClick={() => toggleStackTarget("agent")}
                   >
-                    <h3 className="subsection-title">Agent</h3>
+                    <h3 className="subsection-title">
+                      Agent
+                      {elasticAgent.exists && elasticAgent.version ? (
+                        <span className="subsection-version">
+                          v{elasticAgent.version}
+                        </span>
+                      ) : null}
+                    </h3>
                     <span className="chevron">
                       {stackTarget === "agent" ? "▾" : "▸"}
                     </span>
@@ -979,20 +1666,29 @@ export default function App() {
                             Boolean(busy) ||
                             !es.exists ||
                             !version ||
-                            !selectedExample
+                            !selectedExample ||
+                            !operatorReady
                           }
                           title={
-                            !es.exists
+                            !operatorReady
+                              ? operatorNotReadyReason
+                              : !es.exists
                               ? "Deploy Elasticsearch first"
                               : selectedExampleMeta?.description
                           }
                           onClick={() =>
-                            run("fleet-example", async () => {
-                              await deployFleetExample(
-                                namespace,
-                                version,
-                                selectedExample,
-                              );
+                            confirmRun({
+                              title: `Deploy Agent example ${selectedExampleMeta?.name || selectedExample}?`,
+                              body: `This applies the ${selectedExample} configuration in ${namespace} at stack ${version}. It overwrites managed Fleet policies and the Agent CR.`,
+                              confirmLabel: "Deploy example",
+                              busyKey: "fleet-example",
+                              action: async () => {
+                                await deployFleetExample(
+                                  namespace,
+                                  version,
+                                  selectedExample,
+                                );
+                              },
                             })
                           }
                         >
@@ -1026,9 +1722,11 @@ export default function App() {
                   {stackTarget === "all" ? (
                     <div className="stack-target-body">
                       <p className="hint panel-hint">
-                        Elasticsearch, Kibana (Fleet-ready), optional Logstash,
-                        then Fleet Server. Uses ES heap / nodes and LS heap from
-                        the component forms above when set.
+                        Deploy creates Elasticsearch, Kibana (Fleet-ready),
+                        optional Logstash, then Fleet Server. Upgrade all
+                        patches <code>spec.version</code> on existing CRs only.
+                        Elasticsearch rolling-upgrades only with 3+ master
+                        nodes; smaller clusters restart all ES pods together.
                       </p>
                       <label className="checkbox-inline">
                         <input
@@ -1044,22 +1742,57 @@ export default function App() {
                       <div className="deploy-actions">
                         <button
                           className="primary"
-                          disabled={Boolean(busy) || !version}
+                          disabled={
+                            Boolean(busy) ||
+                            !version ||
+                            !operatorReady ||
+                            (allAction.kind !== "deploy" &&
+                              es.exists &&
+                              esAction.kind === "downgrade")
+                          }
+                          title={
+                            !operatorReady
+                              ? operatorNotReadyReason
+                              : allAction.kind !== "deploy" &&
+                                  es.exists &&
+                                  esAction.kind === "downgrade"
+                                ? "Elasticsearch generally cannot downgrade an existing data directory"
+                                : undefined
+                          }
                           onClick={() =>
-                            run("deploy-all", async () => {
-                              await deployAllQuickstart(namespace, version, {
-                                includeLogstash,
-                                configString:
-                                  logstashConfig.trim() ||
-                                  DEFAULT_LOGSTASH_CONFIG,
-                                heapSize: heapSize || undefined,
-                                lsHeapSize: lsHeapSize || undefined,
-                                nodeCount,
-                              });
+                            confirmRun({
+                              title:
+                                allAction.kind !== "deploy"
+                                  ? `Upgrade all to ${version}?`
+                                  : `Deploy full stack ${version}?`,
+                              body:
+                                allAction.kind !== "deploy"
+                                  ? `This patches spec.version on existing quickstart resources in ${namespace}. Elasticsearch rolling-upgrades only with 3+ master nodes.`
+                                  : `This creates Elasticsearch, Kibana${includeLogstash ? ", Logstash" : ""}, and Fleet Server in ${namespace}.`,
+                              confirmLabel: allAction.label,
+                              busyKey: "deploy-all",
+                              action: async () => {
+                                if (allAction.kind !== "deploy") {
+                                  await upgradeAllQuickstart(
+                                    namespace,
+                                    version,
+                                  );
+                                  return;
+                                }
+                                await deployAllQuickstart(namespace, version, {
+                                  includeLogstash,
+                                  configString:
+                                    logstashConfig.trim() ||
+                                    DEFAULT_LOGSTASH_CONFIG,
+                                  heapSize: heapSize || undefined,
+                                  lsHeapSize: lsHeapSize || undefined,
+                                  nodeCount,
+                                });
+                              },
                             })
                           }
                         >
-                          Deploy all
+                          {allAction.label}
                         </button>
                       </div>
                     </div>
@@ -1094,7 +1827,8 @@ export default function App() {
           <section className="panel">
             <p className="empty-status">
               No quickstart instances in this namespace. Open Stack and use
-              Deploy Elasticsearch to get started.
+              Deploy Elasticsearch to get started. The ECK operator must be
+              running first.
             </p>
           </section>
         ) : (
@@ -1115,8 +1849,15 @@ export default function App() {
                 onViewLogs={openPodLogs}
                 onRefresh={() => run("es-refresh", async () => refreshAll())}
                 onStop={() =>
-                  run("es-delete", async () => {
-                    await deleteElasticsearch(namespace);
+                  confirmRun({
+                    title: "Stop Elasticsearch?",
+                    body: `This deletes Elasticsearch quickstart in ${namespace}. Data volumes may be removed depending on volumeClaimDeletePolicy.`,
+                    confirmLabel: "Stop Elasticsearch",
+                    danger: true,
+                    busyKey: "es-delete",
+                    action: async () => {
+                      await deleteElasticsearch(namespace);
+                    },
                   })
                 }
               />
@@ -1136,8 +1877,15 @@ export default function App() {
                 onViewLogs={openPodLogs}
                 onRefresh={() => run("kb-refresh", async () => refreshAll())}
                 onStop={() =>
-                  run("kb-delete", async () => {
-                    await deleteKibana(namespace);
+                  confirmRun({
+                    title: "Stop Kibana?",
+                    body: `This deletes Kibana quickstart in ${namespace}.`,
+                    confirmLabel: "Stop Kibana",
+                    danger: true,
+                    busyKey: "kb-delete",
+                    action: async () => {
+                      await deleteKibana(namespace);
+                    },
                   })
                 }
               />
@@ -1149,9 +1897,39 @@ export default function App() {
                 busy={busy}
                 onViewLogs={openPodLogs}
                 onRefresh={() => run("ls-refresh", async () => refreshAll())}
+                onUpgrade={
+                  version && ls.version !== version
+                    ? {
+                        label: lsAction.label,
+                        disabled: Boolean(busy) || !operatorReady || !es.exists,
+                        title: !operatorReady
+                          ? operatorNotReadyReason
+                          : !es.exists
+                            ? "Elasticsearch must still exist to upgrade Logstash"
+                            : undefined,
+                        onClick: () =>
+                          confirmRun({
+                            title: `Upgrade Logstash to ${version}?`,
+                            body: `This patches spec.version on Logstash quickstart in ${namespace} from ${ls.version || "unknown"} to ${version}.`,
+                            confirmLabel: lsAction.label,
+                            busyKey: "ls-deploy",
+                            action: async () => {
+                              await upgradeLogstash(namespace, version);
+                            },
+                          }),
+                      }
+                    : undefined
+                }
                 onStop={() =>
-                  run("ls-delete", async () => {
-                    await deleteLogstash(namespace);
+                  confirmRun({
+                    title: "Stop Logstash?",
+                    body: `This deletes Logstash quickstart in ${namespace}.`,
+                    confirmLabel: "Stop Logstash",
+                    danger: true,
+                    busyKey: "ls-delete",
+                    action: async () => {
+                      await deleteLogstash(namespace);
+                    },
                   })
                 }
                 onEditConfig={openLogstashModal}
@@ -1165,8 +1943,15 @@ export default function App() {
                 onViewLogs={openPodLogs}
                 onRefresh={() => run("fs-refresh", async () => refreshAll())}
                 onStop={() =>
-                  run("fs-delete", async () => {
-                    await deleteFleetServer(namespace);
+                  confirmRun({
+                    title: "Stop Fleet Server?",
+                    body: `This deletes Fleet Server in ${namespace}.`,
+                    confirmLabel: "Stop Fleet Server",
+                    danger: true,
+                    busyKey: "fs-delete",
+                    action: async () => {
+                      await deleteFleetServer(namespace);
+                    },
                   })
                 }
               />
@@ -1179,8 +1964,15 @@ export default function App() {
                 onViewLogs={openPodLogs}
                 onRefresh={() => run("ea-refresh", async () => refreshAll())}
                 onStop={() =>
-                  run("ea-delete", async () => {
-                    await deleteElasticAgent(namespace);
+                  confirmRun({
+                    title: "Stop Elastic Agent?",
+                    body: `This deletes Elastic Agent in ${namespace}.`,
+                    confirmLabel: "Stop Elastic Agent",
+                    danger: true,
+                    busyKey: "ea-delete",
+                    action: async () => {
+                      await deleteElasticAgent(namespace);
+                    },
                   })
                 }
               />
@@ -1232,6 +2024,21 @@ export default function App() {
         </EuiPageTemplate.Section>
       </EuiPageTemplate>
 
+      {pendingConfirm ? (
+        <ConfirmDialog
+          pending={pendingConfirm}
+          busy={busy}
+          onCancel={() => setPendingConfirm(null)}
+          onConfirm={() =>
+            run(pendingConfirm.busyKey, async () => {
+              const result = await pendingConfirm.action();
+              setPendingConfirm(null);
+              return result;
+            })
+          }
+        />
+      ) : null}
+
       {logstashModalOpen ? (
         <div
           className="modal-backdrop"
@@ -1275,7 +2082,13 @@ export default function App() {
               <button
                 type="button"
                 className="primary"
-                disabled={Boolean(busy) || !logstashConfig.trim() || !version}
+                disabled={
+                  Boolean(busy) ||
+                  !logstashConfig.trim() ||
+                  !version ||
+                  !operatorReady
+                }
+                title={!operatorReady ? operatorNotReadyReason : undefined}
                 onClick={() =>
                   run("ls-deploy", async () => {
                     await deployLogstash(namespace, version, logstashConfig, {
@@ -1343,6 +2156,131 @@ export default function App() {
                 }
               >
                 Accept EULA &amp; start trial
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {eckApplyOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !busy) setEckApplyOpen(false);
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="eck-apply-modal-title"
+          >
+            <h2 id="eck-apply-modal-title">
+              {eckAction.kind === "switch"
+                ? `Switch operator to ${eckOperatorVersion}?`
+                : eckAction.kind === "upgrade"
+                  ? `Upgrade operator to ${eckOperatorVersion}?`
+                  : `${eckAction.label}?`}
+            </h2>
+            <p className="hint">
+              This applies official YAML manifests from download.elastic.co
+              (CRDs, then operator). The operator lives in{" "}
+              <code>elastic-system</code>. Upgrading can rolling-restart
+              managed Elasticsearch and Kibana pods.
+              {eckAction.kind === "switch"
+                ? " Downgrading removes the current operator first. Deleting CRDs is not part of this action."
+                : ""}
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={() => setEckApplyOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={Boolean(busy)}
+                onClick={() =>
+                  run("eck-install", async () => {
+                    await installEckOperator(eckOperatorVersion);
+                    setEckApplyOpen(false);
+                    await refreshCluster();
+                  })
+                }
+              >
+                {eckAction.label}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {eckUninstallOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !busy)
+              setEckUninstallOpen(false);
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="eck-uninstall-modal-title"
+          >
+            <h2 id="eck-uninstall-modal-title">Uninstall ECK operator?</h2>
+            <p className="hint">
+              This deletes the operator resources from{" "}
+              <code>elastic-system</code> using the official operator.yaml for{" "}
+              {cluster?.eck?.version || eckOperatorVersion}. Stack CRs stay
+              unless you also delete CRDs.
+            </p>
+            <label className="checkbox-inline">
+              <input
+                type="checkbox"
+                checked={eckDeleteCrds}
+                disabled={Boolean(busy)}
+                onChange={(e) => setEckDeleteCrds(e.target.checked)}
+              />
+              Also delete CRDs (removes all Elastic resources in all namespaces)
+            </label>
+            {eckDeleteCrds ? (
+              <p className="hint">
+                Deleting CRDs triggers deletion of Elasticsearch, Kibana,
+                Logstash, Agent, and related custom resources cluster-wide.
+              </p>
+            ) : null}
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={() => setEckUninstallOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                disabled={Boolean(busy)}
+                onClick={() =>
+                  run("eck-uninstall", async () => {
+                    await uninstallEckOperator({
+                      deleteCrds: eckDeleteCrds,
+                      version: cluster?.eck?.version || eckOperatorVersion,
+                    });
+                    setEckUninstallOpen(false);
+                    setEckDeleteCrds(false);
+                    await refreshCluster();
+                  })
+                }
+              >
+                Confirm uninstall
               </button>
             </div>
           </div>
@@ -1594,6 +2532,7 @@ function InstanceCard({
   onStartPortForward,
   onViewLogs,
   onRefresh,
+  onUpgrade,
   onStop,
   onEditConfig,
 }: {
@@ -1606,6 +2545,12 @@ function InstanceCard({
   onStartPortForward?: () => void;
   onViewLogs?: (podName: string) => void;
   onRefresh: () => void;
+  onUpgrade?: {
+    label: string;
+    disabled?: boolean;
+    title?: string;
+    onClick: () => void;
+  };
   onStop: () => void;
   onEditConfig?: () => void;
 }) {
@@ -1678,6 +2623,16 @@ function InstanceCard({
         {onEditConfig ? (
           <button disabled={Boolean(busy)} onClick={onEditConfig}>
             Edit config
+          </button>
+        ) : null}
+        {onUpgrade ? (
+          <button
+            className="primary"
+            disabled={onUpgrade.disabled}
+            title={onUpgrade.title}
+            onClick={onUpgrade.onClick}
+          >
+            {onUpgrade.label}
           </button>
         ) : null}
         <button disabled={Boolean(busy)} onClick={onRefresh}>

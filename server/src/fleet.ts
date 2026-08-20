@@ -7,7 +7,12 @@ import {
   getCredentials,
   getElasticsearchStatus,
   getKibanaStatus,
+  getLogstashStatus,
+  patchCustomObjectVersion,
   statusWhileTerminatingPods,
+  upgradeElasticsearch,
+  upgradeKibana,
+  upgradeLogstash,
   type PodInfo,
   type ResourceStatus,
 } from "./k8s.js";
@@ -1369,6 +1374,74 @@ export async function deployAllQuickstart(
     );
   }
   await deployFleetServer(namespace, version);
+}
+
+export async function upgradeFleetServer(
+  namespace: string,
+  stackVersion: string,
+): Promise<void> {
+  await patchCustomObjectVersion({
+    group: AGENT_GROUP,
+    version: AGENT_API_VERSION,
+    namespace,
+    plural: "agents",
+    name: FLEET_SERVER_NAME,
+    stackVersion,
+  });
+}
+
+export async function upgradeElasticAgent(
+  namespace: string,
+  stackVersion: string,
+): Promise<void> {
+  await patchCustomObjectVersion({
+    group: AGENT_GROUP,
+    version: AGENT_API_VERSION,
+    namespace,
+    plural: "agents",
+    name: ELASTIC_AGENT_NAME,
+    stackVersion,
+  });
+}
+
+export async function upgradeAllQuickstart(
+  namespace: string,
+  stackVersion: string,
+): Promise<{ upgraded: string[] }> {
+  const upgraded: string[] = [];
+  const es = await getElasticsearchStatus(namespace);
+  if (es.exists) {
+    await upgradeElasticsearch(namespace, stackVersion);
+    upgraded.push("elasticsearch");
+  }
+  const kb = await getKibanaStatus(namespace);
+  if (kb.exists) {
+    await upgradeKibana(namespace, stackVersion);
+    upgraded.push("kibana");
+  }
+  const ls = await getLogstashStatus(namespace);
+  if (ls.exists) {
+    await upgradeLogstash(namespace, stackVersion);
+    upgraded.push("logstash");
+  }
+  const fleetServer = await getFleetServerStatus(namespace);
+  if (fleetServer.exists) {
+    await upgradeFleetServer(namespace, stackVersion);
+    upgraded.push("fleet-server");
+  }
+  const elasticAgent = await getElasticAgentStatus(namespace);
+  if (elasticAgent.exists) {
+    await upgradeElasticAgent(namespace, stackVersion);
+    upgraded.push("elastic-agent");
+  }
+  if (upgraded.length === 0) {
+    const err = new Error(
+      "No quickstart stack resources found to upgrade in this namespace.",
+    ) as Error & { statusCode: number };
+    err.statusCode = 404;
+    throw err;
+  }
+  return { upgraded };
 }
 
 export function assertFleetExampleId(id: string): FleetExampleId {
