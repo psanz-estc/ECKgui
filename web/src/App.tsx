@@ -16,6 +16,12 @@ import {
   type IconType,
 } from "@elastic/eui";
 import {
+  APP_DATE,
+  APP_REPO_URL,
+  APP_SLACK,
+  APP_VERSION,
+} from "./app-info";
+import {
   DEFAULT_LOGSTASH_CONFIG,
   PROTECTED_NAMESPACES,
   createNamespace,
@@ -180,7 +186,12 @@ function k8sStatusBadge(cluster: ClusterInfo | null): {
   if (!cluster.reachable) {
     return { label: "Unreachable", className: "unhealthy" };
   }
-  return { label: "Connected", className: "healthy" };
+  return {
+    label: cluster.context
+      ? `Connected to ${cluster.context}`
+      : "Connected",
+    className: "healthy",
+  };
 }
 
 function formatGiBytes(bytes: number): string {
@@ -549,7 +560,8 @@ export default function App() {
     null,
   );
   const [newNamespace, setNewNamespace] = useState("");
-  const [includeLogstash, setIncludeLogstash] = useState(true);
+  const [includeLogstash, setIncludeLogstash] = useState(false);
+  const [includeFleetServer, setIncludeFleetServer] = useState(false);
   const [heapSize, setHeapSize] = useState("");
   const [lsHeapSize, setLsHeapSize] = useState("");
   const [nodeCount, setNodeCount] = useState(1);
@@ -846,13 +858,6 @@ export default function App() {
   }
 
   const badge = overallBadge(es, kb, ls, fleetServer, elasticAgent);
-  const deployedVersion =
-    es.version ||
-    kb.version ||
-    ls.version ||
-    fleetServer.version ||
-    elasticAgent.version ||
-    version;
   const hasInstances =
     es.exists ||
     kb.exists ||
@@ -980,8 +985,9 @@ export default function App() {
               onClick={(e) => e.preventDefault()}
               aria-label="YAEU, Yet Another ECK UI"
               title="Yet Another ECK UI"
+              className="yaeu-brand"
             >
-              YAEU
+              YAEU (Yet Another ECK UI)
             </EuiHeaderLogo>
           </EuiHeaderSectionItem>
         </EuiHeaderSection>
@@ -1005,7 +1011,7 @@ export default function App() {
         offset={48}
         paddingSize="l"
         restrictWidth={1100}
-        grow={false}
+        grow
         className="yaeu-page"
       >
         <EuiPageTemplate.Header
@@ -1017,9 +1023,6 @@ export default function App() {
               </EuiBadge>
             </>
           }
-          description={`Namespace ${namespace} · Stack ${deployedVersion} · ${
-            cluster?.context || "—"
-          }`}
           rightSideItems={[
             <EuiButtonEmpty
               key="refresh"
@@ -1447,6 +1450,124 @@ export default function App() {
               ) : null}
 
               <div className="stack-targets">
+                <div className="stack-target">
+                  <button
+                    type="button"
+                    className="subsection-toggle"
+                    aria-expanded={stackTarget === "all"}
+                    onClick={() => toggleStackTarget("all")}
+                  >
+                    <h3 className="subsection-title">Deploy stack</h3>
+                    <span className="chevron">
+                      {stackTarget === "all" ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {stackTarget === "all" ? (
+                    <div className="stack-target-body">
+                      <ul className="note-list">
+                        <li>
+                          Deploy creates Elasticsearch and Kibana, plus
+                          optional Logstash and Fleet Server.
+                        </li>
+                        <li>
+                          Upgrade all patches <code>spec.version</code> on
+                          existing CRs only. Elasticsearch rolling-upgrades
+                          only with 3+ master nodes; smaller clusters restart
+                          all ES pods together.
+                        </li>
+                      </ul>
+                      <div className="checkbox-row">
+                        <label className="checkbox-inline">
+                          <input
+                            type="checkbox"
+                            checked={includeLogstash}
+                            disabled={Boolean(busy)}
+                            onChange={(e) =>
+                              setIncludeLogstash(e.target.checked)
+                            }
+                          />
+                          Include Logstash
+                        </label>
+                        <label className="checkbox-inline">
+                          <input
+                            type="checkbox"
+                            checked={includeFleetServer}
+                            disabled={Boolean(busy)}
+                            onChange={(e) =>
+                              setIncludeFleetServer(e.target.checked)
+                            }
+                          />
+                          Include Fleet Server
+                        </label>
+                      </div>
+                      <div className="deploy-actions">
+                        <button
+                          className="primary"
+                          disabled={
+                            Boolean(busy) ||
+                            !version ||
+                            !operatorReady ||
+                            (allAction.kind !== "deploy" &&
+                              es.exists &&
+                              esAction.kind === "downgrade")
+                          }
+                          title={
+                            !operatorReady
+                              ? operatorNotReadyReason
+                              : allAction.kind !== "deploy" &&
+                                  es.exists &&
+                                  esAction.kind === "downgrade"
+                                ? "Elasticsearch generally cannot downgrade an existing data directory"
+                                : undefined
+                          }
+                          onClick={() => {
+                            const parts = ["Elasticsearch", "Kibana"];
+                            if (includeLogstash) parts.push("Logstash");
+                            if (includeFleetServer) parts.push("Fleet Server");
+                            const created =
+                              parts.length <= 2
+                                ? parts.join(" and ")
+                                : `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
+                            confirmRun({
+                              title:
+                                allAction.kind !== "deploy"
+                                  ? `Upgrade all to ${version}?`
+                                  : `Deploy stack ${version}?`,
+                              body:
+                                allAction.kind !== "deploy"
+                                  ? `This patches spec.version on existing quickstart resources in ${namespace}. Elasticsearch rolling-upgrades only with 3+ master nodes.`
+                                  : `This creates ${created} in ${namespace}.`,
+                              confirmLabel: allAction.label,
+                              busyKey: "deploy-all",
+                              action: async () => {
+                                if (allAction.kind !== "deploy") {
+                                  await upgradeAllQuickstart(
+                                    namespace,
+                                    version,
+                                  );
+                                  return;
+                                }
+                                await deployAllQuickstart(namespace, version, {
+                                  includeLogstash,
+                                  includeFleetServer,
+                                  configString:
+                                    logstashConfig.trim() ||
+                                    DEFAULT_LOGSTASH_CONFIG,
+                                  heapSize: heapSize || undefined,
+                                  lsHeapSize: lsHeapSize || undefined,
+                                  nodeCount,
+                                });
+                              },
+                            });
+                          }}
+                        >
+                          {allAction.label}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
                 <div className="stack-target">
                   <button
                     type="button"
@@ -1955,98 +2076,6 @@ export default function App() {
                     </div>
                   ) : null}
                 </div>
-
-                <div className="stack-target">
-                  <button
-                    type="button"
-                    className="subsection-toggle"
-                    aria-expanded={stackTarget === "all"}
-                    onClick={() => toggleStackTarget("all")}
-                  >
-                    <h3 className="subsection-title">Deploy full stack</h3>
-                    <span className="chevron">
-                      {stackTarget === "all" ? "▾" : "▸"}
-                    </span>
-                  </button>
-                  {stackTarget === "all" ? (
-                    <div className="stack-target-body">
-                      <p className="hint panel-hint">
-                        Deploy creates Elasticsearch, Kibana (Fleet-ready),
-                        optional Logstash, then Fleet Server. Upgrade all
-                        patches <code>spec.version</code> on existing CRs only.
-                        Elasticsearch rolling-upgrades only with 3+ master
-                        nodes; smaller clusters restart all ES pods together.
-                      </p>
-                      <label className="checkbox-inline">
-                        <input
-                          type="checkbox"
-                          checked={includeLogstash}
-                          disabled={Boolean(busy)}
-                          onChange={(e) =>
-                            setIncludeLogstash(e.target.checked)
-                          }
-                        />
-                        Include Logstash
-                      </label>
-                      <div className="deploy-actions">
-                        <button
-                          className="primary"
-                          disabled={
-                            Boolean(busy) ||
-                            !version ||
-                            !operatorReady ||
-                            (allAction.kind !== "deploy" &&
-                              es.exists &&
-                              esAction.kind === "downgrade")
-                          }
-                          title={
-                            !operatorReady
-                              ? operatorNotReadyReason
-                              : allAction.kind !== "deploy" &&
-                                  es.exists &&
-                                  esAction.kind === "downgrade"
-                                ? "Elasticsearch generally cannot downgrade an existing data directory"
-                                : undefined
-                          }
-                          onClick={() =>
-                            confirmRun({
-                              title:
-                                allAction.kind !== "deploy"
-                                  ? `Upgrade all to ${version}?`
-                                  : `Deploy full stack ${version}?`,
-                              body:
-                                allAction.kind !== "deploy"
-                                  ? `This patches spec.version on existing quickstart resources in ${namespace}. Elasticsearch rolling-upgrades only with 3+ master nodes.`
-                                  : `This creates Elasticsearch, Kibana${includeLogstash ? ", Logstash" : ""}, and Fleet Server in ${namespace}.`,
-                              confirmLabel: allAction.label,
-                              busyKey: "deploy-all",
-                              action: async () => {
-                                if (allAction.kind !== "deploy") {
-                                  await upgradeAllQuickstart(
-                                    namespace,
-                                    version,
-                                  );
-                                  return;
-                                }
-                                await deployAllQuickstart(namespace, version, {
-                                  includeLogstash,
-                                  configString:
-                                    logstashConfig.trim() ||
-                                    DEFAULT_LOGSTASH_CONFIG,
-                                  heapSize: heapSize || undefined,
-                                  lsHeapSize: lsHeapSize || undefined,
-                                  nodeCount,
-                                });
-                              },
-                            })
-                          }
-                        >
-                          {allAction.label}
-                        </button>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
               </div>
 
               <div className="deploy-actions stack-destroy">
@@ -2380,6 +2409,34 @@ export default function App() {
         </section>
         */}
         </EuiPageTemplate.Section>
+        <EuiPageTemplate.BottomBar
+          paddingSize="s"
+          restrictWidth={false}
+          className="yaeu-footer-bar"
+        >
+          <footer className="yaeu-footer">
+            <span>v{APP_VERSION}</span>
+            <span className="yaeu-footer-sep" aria-hidden>
+              -
+            </span>
+            <a
+              href={APP_REPO_URL}
+              target="_blank"
+              rel="noreferrer"
+              title={APP_REPO_URL}
+            >
+              GitHub
+            </a>
+            <span className="yaeu-footer-sep" aria-hidden>
+              -
+            </span>
+            <span>{APP_SLACK}</span>
+            <span className="yaeu-footer-sep" aria-hidden>
+              -
+            </span>
+            <span>Last updated: {APP_DATE}</span>
+          </footer>
+        </EuiPageTemplate.BottomBar>
       </EuiPageTemplate>
 
       {pendingConfirm ? (

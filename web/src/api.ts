@@ -375,6 +375,7 @@ export function deployAllQuickstart(
   version: string,
   options: {
     includeLogstash?: boolean;
+    includeFleetServer?: boolean;
     configString?: string;
     heapSize?: string;
     lsHeapSize?: string;

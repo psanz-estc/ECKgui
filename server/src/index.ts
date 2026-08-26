@@ -623,6 +623,10 @@ app.post("/api/quickstart/deploy-all", async (req, reply) => {
     const version = versionFromBody(body);
     const includeLogstash =
       typeof body.includeLogstash === "boolean" ? body.includeLogstash : true;
+    const includeFleetServer =
+      typeof body.includeFleetServer === "boolean"
+        ? body.includeFleetServer
+        : true;
     const configString =
       typeof body.configString === "string" ? body.configString : undefined;
     const heapSize = heapSizeFromBody(body);
@@ -630,6 +634,7 @@ app.post("/api/quickstart/deploy-all", async (req, reply) => {
     const nodeCount = nodeCountFromBody(body);
     await deployAllQuickstart(namespace, version, {
       includeLogstash,
+      includeFleetServer,
       configString,
       heapSize,
       lsHeapSize,

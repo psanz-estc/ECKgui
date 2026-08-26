@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   deployElasticsearch,
+  deployKibana,
   deployLogstash,
   getCredentials,
   getElasticsearchStatus,
@@ -1358,6 +1359,7 @@ export async function deployAllQuickstart(
   version: string,
   options: {
     includeLogstash?: boolean;
+    includeFleetServer?: boolean;
     configString?: string;
     heapSize?: string;
     lsHeapSize?: string;
@@ -1365,6 +1367,7 @@ export async function deployAllQuickstart(
   } = {},
 ): Promise<void> {
   const includeLogstash = options.includeLogstash !== false;
+  const includeFleetServer = options.includeFleetServer !== false;
   await deployElasticsearch(namespace, version, {
     heapSize: options.heapSize,
     nodeCount: options.nodeCount,
@@ -1377,7 +1380,11 @@ export async function deployAllQuickstart(
       { heapSize: options.lsHeapSize },
     );
   }
-  await deployFleetServer(namespace, version);
+  if (includeFleetServer) {
+    await deployFleetServer(namespace, version);
+  } else {
+    await deployKibana(namespace, version);
+  }
 }
 
 export async function upgradeFleetServer(

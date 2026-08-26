@@ -80,7 +80,7 @@ npm start
 1. Open http://127.0.0.1:5173.
 2. **Kubernetes** — confirm the context is the cluster you want and pick a namespace (default `default`). Protected namespaces (`default`, `kube-system`, `kube-public`, `kube-node-lease`, `elastic-system`) cannot be deleted from the UI.
 3. **ECK** — if the operator is not running, choose a version (default is a recent 3.x) and install it. Wait until the badge shows it is running.
-4. **Stack** — choose a stack version (for example `9.5.2`). Deploy Elasticsearch first (or **Deploy full stack**). For a **rolling** Elasticsearch version upgrade, use **3 or more** master-eligible nodes; 1–2 nodes restart together (no quorum).
+4. **Stack** — choose a stack version (for example `9.5.2`). Deploy Elasticsearch first (or **Deploy stack**). For a **rolling** Elasticsearch version upgrade, use **3 or more** master-eligible nodes; 1–2 nodes restart together (no quorum).
 5. When Elasticsearch is green, deploy Kibana (and optionally Logstash / Fleet).
 6. On the **Elasticsearch** instance card, start the port-forward, then **Open Kibana** (or open `https://localhost:5601`). Accept the self-signed cert. Password is under **Access credentials** (from secret `quickstart-es-elastic-user`).
 
