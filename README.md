@@ -18,6 +18,24 @@ Mutating actions (deploy, upgrade, stop, apply heap/nodes, operator install, and
 
 Resource name is always `quickstart`. Elasticsearch uses `node.store.allow_mmap: false` so it can run on typical local Kubernetes (Rancher Desktop, kind, Colima, and so on).
 
+## Screenshots
+
+Overview — kube context, operator status, and instance cards (health, pods, logs, describe):
+
+![YAEU overview](docs/screenshots/overview.png)
+
+Elasticsearch instance — credentials, port-forward, pod logs and describe:
+
+![Elasticsearch instance](docs/screenshots/elasticsearch.png)
+
+Kubernetes connection and ECK operator (version, trial, reapply):
+
+![Kubernetes and ECK](docs/screenshots/kubernetes-eck.png)
+
+Stack — pick a version, deploy individual products or the full quickstart:
+
+![Stack](docs/screenshots/stack.png)
+
 ## Requirements
 
 - **Node.js 20+** and npm
@@ -110,4 +128,5 @@ yaeu/
   server/   Fastify API + Kubernetes client
   web/      Vite + React UI
   scripts/  cluster smoke test
+  docs/     README screenshots
 ```
