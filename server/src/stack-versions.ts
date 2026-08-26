@@ -54,7 +54,7 @@ async function fetchJson(url: string, timeoutMs: number): Promise<unknown> {
   const res = await fetch(url, {
     headers: {
       Accept: "application/json",
-      "User-Agent": "ECKgui",
+      "User-Agent": "YAEU",
     },
     signal: AbortSignal.timeout(timeoutMs),
   });

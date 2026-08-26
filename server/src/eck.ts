@@ -13,7 +13,7 @@ export const ES_CRD_NAME = "elasticsearches.elasticsearch.k8s.elastic.co";
 
 const OPERATOR_NAME = "elastic-operator";
 const OPERATOR_LABEL = "control-plane=elastic-operator";
-const FIELD_MANAGER = "eckgui";
+const FIELD_MANAGER = "yaeu";
 const VERSION_RE = /^\d+\.\d+\.\d+([+.-][A-Za-z0-9.]+)?$/;
 const FALLBACK_ECK_VERSIONS = [
   "3.5.0",
@@ -45,6 +45,56 @@ export type EckOperatorVersionList = {
   versions: string[];
   source: "github" | "fallback";
 };
+
+export type EckApplyProgress = {
+  active: boolean;
+  action: "install" | "uninstall" | null;
+  version?: string;
+  step: string;
+  current?: { kind?: string; name?: string; namespace?: string };
+  done: number;
+  total: number;
+};
+
+const emptyApplyProgress = (): EckApplyProgress => ({
+  active: false,
+  action: null,
+  step: "",
+  done: 0,
+  total: 0,
+});
+
+let applyProgress: EckApplyProgress = emptyApplyProgress();
+
+export function getEckApplyProgress(): EckApplyProgress {
+  return {
+    ...applyProgress,
+    current: applyProgress.current ? { ...applyProgress.current } : undefined,
+  };
+}
+
+function setApplyProgress(partial: Partial<EckApplyProgress>) {
+  applyProgress = { ...applyProgress, ...partial };
+}
+
+function objectRef(spec: KubernetesObject): {
+  kind?: string;
+  name?: string;
+  namespace?: string;
+} {
+  return {
+    kind: spec.kind,
+    name: spec.metadata?.name,
+    namespace: spec.metadata?.namespace,
+  };
+}
+
+function objectLabel(spec: KubernetesObject): string {
+  const kind = spec.kind || "object";
+  const name = spec.metadata?.name || "";
+  const ns = spec.metadata?.namespace;
+  return ns ? `${kind} ${ns}/${name}` : `${kind} ${name}`.trim();
+}
 
 function clients() {
   const kc = loadKubeConfig();
@@ -83,20 +133,69 @@ function isNotFound(err: unknown): boolean {
 }
 
 function errorMessage(err: unknown): string {
-  if (typeof err === "object" && err !== null) {
-    const maybe = err as {
-      body?: { message?: string };
-      message?: string;
-      response?: { body?: { message?: string } };
-    };
-    return (
-      maybe.body?.message ||
-      maybe.response?.body?.message ||
-      maybe.message ||
-      "Unknown Kubernetes error"
-    );
-  }
+  const extracted = extractK8sStatusMessage(err);
+  if (extracted) return extracted;
   return String(err);
+}
+
+function extractK8sStatusMessage(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const maybe = err as {
+    body?: unknown;
+    message?: string;
+    response?: { body?: unknown };
+  };
+
+  const fromBody = (body: unknown): string | undefined => {
+    if (typeof body === "string") {
+      try {
+        const parsed = JSON.parse(body) as { message?: unknown };
+        if (typeof parsed.message === "string") return parsed.message;
+      } catch {
+        return body;
+      }
+    }
+    if (typeof body === "object" && body !== null && "message" in body) {
+      const message = (body as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    }
+    return undefined;
+  };
+
+  const nested = fromBody(maybe.body) ?? fromBody(maybe.response?.body);
+  if (nested) return nested;
+
+  const raw = maybe.message;
+  if (!raw) return undefined;
+  const marker = "Unsuccessful HTTP Request Body:";
+  const idx = raw.indexOf(marker);
+  if (idx < 0) return raw;
+  let jsonPart = raw.slice(idx + marker.length).trim();
+  if (jsonPart.startsWith('"')) {
+    try {
+      jsonPart = JSON.parse(jsonPart) as string;
+    } catch {
+      jsonPart = jsonPart
+        .replace(/^"/, "")
+        .replace(/"\s*$/, "")
+        .replace(/\\n/g, "\n")
+        .replace(/\\"/g, '"');
+    }
+  }
+  try {
+    const parsed = JSON.parse(jsonPart) as { message?: unknown };
+    if (typeof parsed.message === "string") return parsed.message;
+  } catch {
+    // Keep the original client message.
+  }
+  return raw;
+}
+
+function isRbacPrivilegeEscalation(err: unknown): boolean {
+  const message = extractK8sStatusMessage(err) ?? String(err);
+  return message.includes(
+    "attempting to grant RBAC permissions not currently held",
+  );
 }
 
 function httpError(message: string, statusCode: number): Error & {
@@ -304,7 +403,7 @@ async function fetchText(url: string, timeoutMs: number): Promise<string> {
   const res = await fetch(url, {
     headers: {
       Accept: "application/yaml, text/plain, application/json, */*",
-      "User-Agent": "ECKgui",
+      "User-Agent": "YAEU",
     },
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -389,19 +488,30 @@ async function deleteObject(
   }
 }
 
-async function applyManifests(yaml: string): Promise<number> {
+async function applyManifests(
+  yaml: string,
+  onEach?: (spec: KubernetesObject, index: number, total: number) => void,
+): Promise<number> {
   const docs = parseManifests(yaml);
   const { objects } = clients();
-  for (const doc of docs) {
+  for (let i = 0; i < docs.length; i++) {
+    const doc = docs[i];
+    onEach?.(doc, i, docs.length);
     await applyObject(objects, doc);
   }
   return docs.length;
 }
 
-async function deleteManifests(yaml: string): Promise<number> {
+async function deleteManifests(
+  yaml: string,
+  onEach?: (spec: KubernetesObject, index: number, total: number) => void,
+): Promise<number> {
   const docs = parseManifests(yaml);
   const { objects } = clients();
-  for (const doc of [...docs].reverse()) {
+  const reversed = [...docs].reverse();
+  for (let i = 0; i < reversed.length; i++) {
+    const doc = reversed[i];
+    onEach?.(doc, i, reversed.length);
     await deleteObject(objects, doc);
   }
   return docs.length;
@@ -454,45 +564,105 @@ export async function installOrUpgradeEckOperator(
   version: string,
 ): Promise<EckOperatorStatus> {
   const target = normalizeEckOperatorVersion(version);
-  const current = await getEckOperatorStatus();
-
-  const [crdsYaml, operatorYaml] = await Promise.all([
-    fetchText(manifestUrl(target, "crds.yaml"), 60_000),
-    fetchText(manifestUrl(target, "operator.yaml"), 60_000),
-  ]);
-
-  const currentVersion = current.version;
-  const isDowngrade =
-    Boolean(currentVersion) && compareVersions(target, currentVersion!) < 0;
-
-  if (isDowngrade && (current.installed || current.podName || current.version)) {
-    const uninstallVersion = currentVersion || target;
-    try {
-      const previousOperator = await fetchText(
-        manifestUrl(uninstallVersion, "operator.yaml"),
-        60_000,
-      );
-      await deleteManifests(previousOperator);
-    } catch (err) {
-      throw httpError(
-        `Could not remove ECK operator ${uninstallVersion} before installing ${target}: ${errorMessage(err)}`,
-        502,
-      );
-    }
-  }
+  setApplyProgress({
+    active: true,
+    action: "install",
+    version: target,
+    step: `Fetching ECK ${target} CRDs and operator YAML from download.elastic.co…`,
+    current: undefined,
+    done: 0,
+    total: 0,
+  });
 
   try {
-    await applyManifests(crdsYaml);
-    await applyManifests(operatorYaml);
-  } catch (err) {
-    throw httpError(
-      `Failed to apply ECK ${target} manifests: ${errorMessage(err)}`,
-      getStatusCode(err) || 502,
-    );
-  }
+    const current = await getEckOperatorStatus();
 
-  await new Promise((r) => setTimeout(r, 1_500));
-  return getEckOperatorStatus();
+    const [crdsYaml, operatorYaml] = await Promise.all([
+      fetchText(manifestUrl(target, "crds.yaml"), 60_000),
+      fetchText(manifestUrl(target, "operator.yaml"), 60_000),
+    ]);
+
+    const currentVersion = current.version;
+    const isDowngrade =
+      Boolean(currentVersion) && compareVersions(target, currentVersion!) < 0;
+
+    if (isDowngrade && (current.installed || current.podName || current.version)) {
+      const uninstallVersion = currentVersion || target;
+      setApplyProgress({
+        step: `Removing ECK operator ${uninstallVersion} before installing ${target}…`,
+      });
+      try {
+        const previousOperator = await fetchText(
+          manifestUrl(uninstallVersion, "operator.yaml"),
+          60_000,
+        );
+        await deleteManifests(previousOperator, (spec) => {
+          setApplyProgress({
+            step: `Removing ${objectLabel(spec)}`,
+            current: objectRef(spec),
+          });
+        });
+      } catch (err) {
+        throw httpError(
+          `Could not remove ECK operator ${uninstallVersion} before installing ${target}: ${errorMessage(err)}`,
+          502,
+        );
+      }
+    }
+
+    const crdDocs = parseManifests(crdsYaml);
+    const operatorDocs = parseManifests(operatorYaml);
+    const total = crdDocs.length + operatorDocs.length;
+    let done = 0;
+    setApplyProgress({
+      step: `Applying ${crdDocs.length} CRDs, then the operator into elastic-system…`,
+      done: 0,
+      total,
+    });
+
+    const track = (spec: KubernetesObject, prefix: string) => {
+      done += 1;
+      setApplyProgress({
+        step: `${prefix} ${objectLabel(spec)} (${done}/${total})`,
+        current: objectRef(spec),
+        done,
+        total,
+      });
+    };
+
+    try {
+      await applyManifests(crdsYaml, (spec) => track(spec, "Applying CRD"));
+      await applyManifests(operatorYaml, (spec) =>
+        track(spec, "Applying operator"),
+      );
+    } catch (err) {
+      if (isRbacPrivilegeEscalation(err)) {
+        throw httpError(
+          `Cannot install ECK ${target}: your Kubernetes user is not allowed to create ClusterRole "elastic-operator". The API server blocks granting RBAC permissions you do not already hold (privilege escalation prevention). On GKE, bind cluster-admin to your gcloud user (the ClusterRoleBinding name can be any unique value, for example cluster-pablo-admin-binding), then retry.`,
+          403,
+        );
+      }
+      throw httpError(
+        `Failed to apply ECK ${target} manifests: ${errorMessage(err)}`,
+        getStatusCode(err) || 502,
+      );
+    }
+
+    setApplyProgress({
+      step: "Waiting for the operator pod in elastic-system…",
+      current: undefined,
+      done: total,
+      total,
+    });
+    await new Promise((r) => setTimeout(r, 1_500));
+    return getEckOperatorStatus();
+  } finally {
+    setApplyProgress({
+      ...applyProgress,
+      active: false,
+      current: undefined,
+    });
+  }
 }
 
 export async function uninstallEckOperator(options: {
@@ -504,31 +674,70 @@ export async function uninstallEckOperator(options: {
     options.version || status.version || DEFAULT_ECK_OPERATOR_VERSION,
   );
 
-  try {
-    const operatorYaml = await fetchText(
-      manifestUrl(version, "operator.yaml"),
-      60_000,
-    );
-    await deleteManifests(operatorYaml);
-  } catch (err) {
-    throw httpError(
-      `Failed to uninstall ECK operator ${version}: ${errorMessage(err)}`,
-      getStatusCode(err) || 502,
-    );
-  }
+  setApplyProgress({
+    active: true,
+    action: "uninstall",
+    version,
+    step: `Fetching ECK ${version} operator.yaml to delete its resources…`,
+    current: undefined,
+    done: 0,
+    total: 0,
+  });
 
-  if (options.deleteCrds) {
+  try {
     try {
-      const crdsYaml = await fetchText(manifestUrl(version, "crds.yaml"), 60_000);
-      await deleteManifests(crdsYaml);
+      const operatorYaml = await fetchText(
+        manifestUrl(version, "operator.yaml"),
+        60_000,
+      );
+      await deleteManifests(operatorYaml, (spec, index, total) => {
+        setApplyProgress({
+          step: `Removing ${objectLabel(spec)} (${index + 1}/${total})`,
+          current: objectRef(spec),
+          done: index + 1,
+          total,
+        });
+      });
     } catch (err) {
       throw httpError(
-        `Operator removed, but deleting CRDs failed: ${errorMessage(err)}`,
+        `Failed to uninstall ECK operator ${version}: ${errorMessage(err)}`,
         getStatusCode(err) || 502,
       );
     }
-  }
 
-  await new Promise((r) => setTimeout(r, 1_000));
-  return getEckOperatorStatus();
+    if (options.deleteCrds) {
+      try {
+        setApplyProgress({
+          step: `Deleting ECK ${version} CRDs (this removes Elastic CRs cluster-wide)…`,
+        });
+        const crdsYaml = await fetchText(manifestUrl(version, "crds.yaml"), 60_000);
+        await deleteManifests(crdsYaml, (spec, index, total) => {
+          setApplyProgress({
+            step: `Deleting CRD ${objectLabel(spec)} (${index + 1}/${total})`,
+            current: objectRef(spec),
+            done: index + 1,
+            total,
+          });
+        });
+      } catch (err) {
+        throw httpError(
+          `Operator removed, but deleting CRDs failed: ${errorMessage(err)}`,
+          getStatusCode(err) || 502,
+        );
+      }
+    }
+
+    setApplyProgress({
+      step: "Waiting for Kubernetes to finish removing operator resources…",
+      current: undefined,
+    });
+    await new Promise((r) => setTimeout(r, 1_000));
+    return getEckOperatorStatus();
+  } finally {
+    setApplyProgress({
+      ...applyProgress,
+      active: false,
+      current: undefined,
+    });
+  }
 }

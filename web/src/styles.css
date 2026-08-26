@@ -40,8 +40,13 @@ textarea {
   font: inherit;
 }
 
-.eckgui-page {
+.yaeu-page {
   min-height: calc(100vh - 48px);
+}
+
+.error-text {
+  white-space: pre-wrap;
+  margin: 0;
 }
 
 .badge {
@@ -142,6 +147,13 @@ textarea {
   background: transparent;
 }
 
+.panel button.linkish {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+}
+
 .panel button:disabled,
 .instance-card button:disabled,
 .modal button:disabled,
@@ -183,6 +195,26 @@ textarea {
 
 .panel-hint {
   margin: 0 0 0.85rem;
+}
+
+.note-list {
+  margin: 0 0 0.85rem;
+  padding-left: 1.15rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.summary-grid + .note-list {
+  margin-top: 1rem;
+}
+
+.note-list li + li {
+  margin-top: 0.35rem;
+}
+
+.note-list li::marker {
+  color: color-mix(in srgb, var(--muted) 70%, var(--line));
 }
 
 .deploy-actions {
@@ -352,11 +384,27 @@ textarea {
   word-break: break-all;
 }
 
-.credentials-block {
+.credentials-details {
+  display: grid;
+  gap: 0.35rem;
   margin: 0 0 0.75rem;
-  padding: 0.55rem 0.7rem;
-  background: var(--bg0);
-  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
+.credentials-details div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  color: var(--muted);
+}
+
+.credentials-details strong {
+  color: var(--text);
+  font-weight: 500;
+  word-break: break-all;
+  text-align: right;
 }
 
 .credentials-toggle {
@@ -371,37 +419,6 @@ textarea {
   color: inherit;
   cursor: pointer;
   text-align: left;
-}
-
-.credentials-title {
-  margin: 0;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--muted);
-}
-
-.credentials-block .meta {
-  display: grid;
-  gap: 0.35rem;
-  margin: 0.55rem 0 0;
-  font-family: var(--mono);
-  font-size: 0.85rem;
-}
-
-.credentials-block .meta div {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 1rem;
-  color: var(--muted);
-}
-
-.credentials-block .meta strong {
-  color: var(--text);
-  font-weight: 500;
-  word-break: break-all;
-  text-align: right;
 }
 
 .pf-source {
@@ -551,6 +568,17 @@ textarea {
   gap: 0.5rem;
 }
 
+.instance-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.instance-logo {
+  flex-shrink: 0;
+}
+
 .instance-meta {
   display: flex;
   flex-wrap: wrap;
@@ -605,60 +633,36 @@ textarea {
 }
 
 .service-forwards-title {
-  margin: 0 0 0.55rem;
+  margin: 0;
   font-size: 0.78rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
 }
 
-.service-block {
-  margin-bottom: 0.75rem;
-}
-
-.service-head {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: 0.45rem;
-  margin-bottom: 0.4rem;
-  font-size: 0.85rem;
-}
-
-.service-head span {
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 0.75rem;
+.instance-card .credentials-toggle {
+  border: 0;
+  background: transparent;
+  padding: 0.15rem 0;
 }
 
 .service-port-row {
   display: grid;
-  gap: 0.4rem;
-  margin-bottom: 0.65rem;
-  padding: 0.55rem 0.65rem;
-  background: var(--bg0);
-  border: 1px solid var(--line);
+  grid-template-columns: 1fr auto auto;
+  gap: 0.55rem;
+  align-items: center;
+  padding: 0.3rem 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
 
-.service-port-meta {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: 0.45rem;
+.service-port-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
   font-family: var(--mono);
   font-size: 0.75rem;
   color: var(--muted);
-}
-
-.service-port-row pre {
-  margin: 0;
-  padding: 0.45rem 0.55rem;
-  overflow-x: auto;
-  background: color-mix(in srgb, var(--bg1) 80%, black);
-  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  color: #c9d7e8;
 }
 
 .pods {
@@ -671,12 +675,15 @@ textarea {
 }
 
 .pods li {
-  display: grid;
-  grid-template-columns: 1fr auto auto auto auto;
-  gap: 0.55rem;
-  align-items: center;
   padding: 0.3rem 0;
   border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.pod-main {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto auto auto;
+  gap: 0.55rem;
+  align-items: center;
 }
 
 .pods .pod-name {
@@ -686,9 +693,45 @@ textarea {
   min-width: 0;
 }
 
+.pod-forward {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.55rem;
+  align-items: center;
+  margin-top: 0.15rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.pod-forward-label {
+  min-width: 0;
+}
+
+.pod-forward-urls {
+  text-align: right;
+  min-width: 0;
+}
+
+.pod-forward-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.pod-forward-link:hover {
+  text-decoration: underline;
+}
+
 .pod-logs-btn {
   padding: 0.2rem 0.45rem;
   font-size: 0.72rem;
+}
+
+.pod-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.85rem;
+  padding: 0.15rem 0.35rem;
 }
 
 .empty-status {
@@ -782,6 +825,15 @@ textarea {
   color: var(--ok);
 }
 
+.pf-status.running a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.pf-status.running a:hover {
+  text-decoration: underline;
+}
+
 .pf-status.stopped {
   color: var(--muted);
 }
@@ -867,6 +919,126 @@ textarea {
   justify-content: flex-end;
   gap: 0.5rem;
   margin-top: 0.85rem;
+}
+
+.modal-steps,
+.modal-notes {
+  margin: 0 0 0.85rem;
+  padding-left: 1.2rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.modal-steps li + li,
+.modal-notes li + li {
+  margin-top: 0.35rem;
+}
+
+.modal-notes {
+  list-style: disc;
+}
+
+.modal-callout {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0 0 0.85rem;
+  padding: 0.7rem 0.8rem;
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg2));
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  font-size: 0.86rem;
+  color: var(--text);
+}
+
+.modal-callout p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.modal-callout-warn {
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg2));
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--line));
+}
+
+.modal-backdrop-stacked {
+  z-index: 50;
+}
+
+.code-block {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0 0 0.85rem;
+}
+
+.code-block pre {
+  margin: 0;
+  overflow: auto;
+  padding: 0.7rem 0.8rem;
+  background: var(--bg0);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.code-block button {
+  justify-self: end;
+}
+
+.install-progress {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0 0 0.85rem;
+}
+
+.progress-track {
+  height: 0.45rem;
+  border-radius: 999px;
+  background: var(--bg0);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.progress-track-indeterminate .progress-fill {
+  width: 35%;
+  animation: progress-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+.mono-hint {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+button.linkish {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+button.linkish:hover {
+  color: var(--text);
 }
 
 .logs-modal {

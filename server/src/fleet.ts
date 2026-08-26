@@ -182,7 +182,7 @@ function isNotFound(err: unknown): boolean {
 }
 
 function roleName(base: string, namespace: string): string {
-  return `eckgui-${base}-${namespace}`.slice(0, 63);
+  return `yaeu-${base}-${namespace}`.slice(0, 63);
 }
 
 function esHttpHost(namespace: string): string {
@@ -1141,10 +1141,14 @@ export async function deleteElasticAgent(namespace: string): Promise<void> {
 
 export async function deleteFleetRbac(namespace: string): Promise<void> {
   const { core, rbac } = clients();
-  const fsRole = roleName("fleet-server", namespace);
-  const eaRole = roleName("elastic-agent", namespace);
+  const names = [
+    roleName("fleet-server", namespace),
+    roleName("elastic-agent", namespace),
+    `eckgui-fleet-server-${namespace}`.slice(0, 63),
+    `eckgui-elastic-agent-${namespace}`.slice(0, 63),
+  ];
 
-  for (const name of [fsRole, eaRole]) {
+  for (const name of names) {
     try {
       await rbac.deleteClusterRoleBinding({ name });
     } catch (err) {
@@ -1166,7 +1170,7 @@ export async function deleteFleetRbac(namespace: string): Promise<void> {
   }
 }
 
-/** Delete Agents, APM service, permissions DS, and ECKgui Fleet RBAC. */
+/** Delete Agents, APM service, permissions DS, and YAEU Fleet RBAC. */
 export async function deleteFleetResources(namespace: string): Promise<void> {
   await deleteElasticAgent(namespace);
   await deleteFleetServer(namespace);

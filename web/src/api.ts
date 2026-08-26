@@ -21,6 +21,16 @@ export type EckOperatorVersionList = {
   source: "github" | "fallback";
 };
 
+export type EckApplyProgress = {
+  active: boolean;
+  action: "install" | "uninstall" | null;
+  version?: string;
+  step: string;
+  current?: { kind?: string; name?: string; namespace?: string };
+  done: number;
+  total: number;
+};
+
 export type StackVersionList = {
   defaultVersion: string;
   versions: string[];
@@ -149,6 +159,10 @@ export function getEckOperator() {
   return request<EckOperatorStatus>("/api/eck/operator");
 }
 
+export function getEckApplyProgress() {
+  return request<EckApplyProgress>("/api/eck/operator/progress");
+}
+
 export function getEckOperatorVersions() {
   return request<EckOperatorVersionList>("/api/eck/operator/versions");
 }
@@ -182,6 +196,13 @@ export function startEckTrialLicense() {
   return request<EckLicenseStatus>("/api/eck/license/trial", {
     method: "POST",
     body: JSON.stringify({ acceptEula: true }),
+  });
+}
+
+export function applyEckEnterpriseLicense(licenseJson: string) {
+  return request<EckLicenseStatus>("/api/eck/license", {
+    method: "POST",
+    body: JSON.stringify({ licenseJson }),
   });
 }
 
@@ -403,6 +424,15 @@ export function getPodLogs(
   }>(`/api/pods/${encodeURIComponent(name)}/logs?${params.toString()}`);
 }
 
+export function getPodDescribe(namespace: string, name: string) {
+  const params = new URLSearchParams({ namespace });
+  return request<{
+    name: string;
+    namespace: string;
+    describe: string;
+  }>(`/api/pods/${encodeURIComponent(name)}/describe?${params.toString()}`);
+}
+
 export type FleetExampleMeta = {
   id: string;
   name: string;
@@ -481,6 +511,22 @@ export function deleteElasticAgent(namespace: string) {
   return request<{ ok: boolean }>(
     `/api/elastic-agent?namespace=${encodeURIComponent(namespace)}`,
     { method: "DELETE" },
+  );
+}
+
+export type RestartableResource =
+  | "elasticsearch"
+  | "kibana"
+  | "fleet-server"
+  | "elastic-agent";
+
+export function restartInstance(
+  resource: RestartableResource,
+  namespace: string,
+) {
+  return request<{ deleted: string[] }>(
+    `/api/${resource}/restart?namespace=${encodeURIComponent(namespace)}`,
+    { method: "POST" },
   );
 }
 

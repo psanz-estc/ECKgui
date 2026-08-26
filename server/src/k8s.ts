@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import * as k8s from "@kubernetes/client-node";
 import {
   compareVersions,
@@ -8,6 +9,7 @@ import {
 import {
   listKubeContexts,
   loadKubeConfig,
+  kubectlContextArgs,
   setActiveContext,
 } from "./kubeconfig.js";
 
@@ -125,6 +127,10 @@ type CoreApi = {
     namespace: string;
   }) => Promise<{ items?: k8s.V1PersistentVolumeClaim[] }>;
   deleteNamespacedPersistentVolumeClaim: (p: {
+    name: string;
+    namespace: string;
+  }) => Promise<unknown>;
+  deleteNamespacedPod: (p: {
     name: string;
     namespace: string;
   }) => Promise<unknown>;
@@ -389,7 +395,7 @@ export async function deleteNamespace(name: string): Promise<void> {
   const ns = assertValidNamespaceName(name);
   if (isProtectedNamespace(ns)) {
     const err = new Error(
-      `Namespace "${ns}" is protected and cannot be deleted from ECKgui.`,
+      `Namespace "${ns}" is protected and cannot be deleted from YAEU.`,
     ) as Error & { statusCode: number };
     err.statusCode = 400;
     throw err;
@@ -1182,10 +1188,14 @@ export async function getLogstashStatus(
 
     const status = (obj.status ?? {}) as Record<string, unknown>;
     const spec = (obj.spec ?? {}) as Record<string, unknown>;
-    const [pods, services] = await Promise.all([
+    const [pods, liveServices] = await Promise.all([
       listPods(core, namespace, "logstash.k8s.elastic.co/name=quickstart"),
       listLogstashServices(core, namespace),
     ]);
+    const services = mergeLogstashServices(
+      liveServices,
+      servicesFromLogstashSpec(spec, namespace),
+    );
 
     const available =
       typeof status.availableNodes === "number"
@@ -1309,6 +1319,37 @@ async function listPods(
   }));
 }
 
+const RESTART_SELECTORS = {
+  elasticsearch: "elasticsearch.k8s.elastic.co/name=quickstart",
+  kibana: "kibana.k8s.elastic.co/name=quickstart",
+  "fleet-server": "agent.k8s.elastic.co/name=fleet-server-quickstart",
+  "elastic-agent": "agent.k8s.elastic.co/name=elastic-agent-quickstart",
+} as const;
+
+export type RestartableResource = keyof typeof RESTART_SELECTORS;
+
+/** Delete pods for a resource so ECK recreates them (CR is unchanged). */
+export async function restartPods(
+  namespace: string,
+  resource: RestartableResource,
+): Promise<{ deleted: string[] }> {
+  const { core } = clients();
+  const labelSelector = RESTART_SELECTORS[resource];
+  const res = await core.listNamespacedPod({ namespace, labelSelector });
+  const deleted: string[] = [];
+  for (const pod of res.items ?? []) {
+    const name = pod.metadata?.name;
+    if (!name) continue;
+    try {
+      await core.deleteNamespacedPod({ name, namespace });
+      deleted.push(name);
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
+  }
+  return { deleted };
+}
+
 /** Keep showing a resource while pods are still Terminating after the CR is gone. */
 async function statusWhileTerminating(
   core: CoreApi,
@@ -1340,6 +1381,99 @@ export async function statusWhileTerminatingPods(
   return statusWhileTerminating(core, name, labelSelector, namespace, extras);
 }
 
+function logstashServicePorts(
+  namespace: string,
+  serviceName: string,
+  ports: Array<{
+    name?: string;
+    port: number;
+    targetPort?: string | number;
+    nodePort?: number;
+    protocol?: string;
+  }>,
+): ServicePortInfo[] {
+  return ports.map((p) => {
+    const port = p.port;
+    return {
+      name: p.name || String(port),
+      port,
+      targetPort: p.targetPort,
+      nodePort: p.nodePort,
+      protocol: p.protocol || "TCP",
+      forwardTarget: `svc:${serviceName}:${port}`,
+      command: `kubectl -n ${namespace} port-forward service/${serviceName} ${port}:${port}`,
+    };
+  });
+}
+
+function servicesFromLogstashSpec(
+  spec: Record<string, unknown>,
+  namespace: string,
+): ServiceInfo[] {
+  const declared = spec.services;
+  if (!Array.isArray(declared)) return [];
+
+  return declared
+    .map((entry) => {
+      if (typeof entry !== "object" || entry === null) return null;
+      const item = entry as {
+        name?: unknown;
+        service?: { spec?: { type?: unknown; ports?: unknown } };
+      };
+      const shortName = typeof item.name === "string" ? item.name : "";
+      if (!shortName) return null;
+      const name = `${RESOURCE_NAME}-ls-${shortName}`;
+      const svcSpec = item.service?.spec;
+      const rawPorts = Array.isArray(svcSpec?.ports) ? svcSpec.ports : [];
+      const ports = logstashServicePorts(
+        namespace,
+        name,
+        rawPorts.flatMap((p) => {
+          if (typeof p !== "object" || p === null) return [];
+          const port = (p as { port?: unknown }).port;
+          if (typeof port !== "number") return [];
+          const targetPort = (p as { targetPort?: unknown }).targetPort;
+          return [
+            {
+              name:
+                typeof (p as { name?: unknown }).name === "string"
+                  ? (p as { name: string }).name
+                  : undefined,
+              port,
+              targetPort:
+                typeof targetPort === "string" || typeof targetPort === "number"
+                  ? targetPort
+                  : undefined,
+              protocol:
+                typeof (p as { protocol?: unknown }).protocol === "string"
+                  ? (p as { protocol: string }).protocol
+                  : undefined,
+            },
+          ];
+        }),
+      );
+      if (ports.length === 0) return null;
+      return {
+        name,
+        type:
+          typeof svcSpec?.type === "string" ? svcSpec.type : "ClusterIP",
+        ports,
+      } satisfies ServiceInfo;
+    })
+    .filter((svc): svc is ServiceInfo => svc !== null);
+}
+
+function mergeLogstashServices(
+  live: ServiceInfo[],
+  fromSpec: ServiceInfo[],
+): ServiceInfo[] {
+  if (live.length === 0) return fromSpec;
+  const liveNames = new Set(live.map((svc) => svc.name));
+  return [...live, ...fromSpec.filter((svc) => !liveNames.has(svc.name))].sort(
+    (a, b) => a.name.localeCompare(b.name),
+  );
+}
+
 async function listLogstashServices(
   core: CoreApi,
   namespace: string,
@@ -1353,23 +1487,25 @@ async function listLogstashServices(
     .map((svc) => {
       const name = svc.metadata?.name || "unknown";
       const type = svc.spec?.type || "ClusterIP";
-      const ports = (svc.spec?.ports ?? [])
-        .filter((p): p is k8s.V1ServicePort & { port: number } => typeof p.port === "number")
-        .map((p) => {
-          const port = p.port;
-          return {
-            name: p.name || String(port),
-            port,
+      const ports = logstashServicePorts(
+        namespace,
+        name,
+        (svc.spec?.ports ?? [])
+          .filter(
+            (p): p is k8s.V1ServicePort & { port: number } =>
+              typeof p.port === "number",
+          )
+          .map((p) => ({
+            name: p.name,
+            port: p.port,
             targetPort:
               typeof p.targetPort === "object" && p.targetPort !== null
                 ? undefined
                 : (p.targetPort as string | number | undefined),
             nodePort: typeof p.nodePort === "number" ? p.nodePort : undefined,
-            protocol: p.protocol || "TCP",
-            forwardTarget: `svc:${name}:${port}`,
-            command: `kubectl -n ${namespace} port-forward service/${name} ${port}:${port}`,
-          };
-        });
+            protocol: p.protocol,
+          })),
+      );
 
       return {
         name,
@@ -1457,8 +1593,6 @@ export async function getEckLicenseStatus(): Promise<EckLicenseStatus> {
   if (trialSecretExists && levelIsBasic) {
     message =
       "A trial secret already exists (or a trial was used before). ECK only allows one trial activation.";
-  } else if (!levelIsBasic) {
-    message = `Current ECK license level is "${level}".`;
   }
 
   return {
@@ -1523,6 +1657,91 @@ export async function startEckTrial(options: {
   }
 
   // Operator updates elastic-licensing asynchronously; return refreshed best-effort status.
+  await new Promise((r) => setTimeout(r, 2_000));
+  return getEckLicenseStatus();
+}
+
+const ECK_LICENSE_SECRET_NAME = "eck-license";
+const MAX_LICENSE_JSON_BYTES = 1_000_000;
+
+/** Apply an ECK orchestration Enterprise license JSON as a Secret in elastic-system. */
+export async function applyEckEnterpriseLicense(
+  licenseJson: string,
+): Promise<EckLicenseStatus> {
+  const trimmed = licenseJson.trim();
+  if (!trimmed) {
+    throw httpError("License JSON is required.", 400);
+  }
+  if (Buffer.byteLength(trimmed, "utf8") > MAX_LICENSE_JSON_BYTES) {
+    throw httpError("License file is too large (max 1 MB).", 400);
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      throw new Error("not an object");
+    }
+  } catch {
+    throw httpError("License file is not valid JSON.", 400);
+  }
+
+  const { core } = clients();
+  const operatorNamespace = ECK_OPERATOR_NAMESPACE;
+  let name = ECK_LICENSE_SECRET_NAME;
+  try {
+    await core.readNamespacedSecret({
+      name,
+      namespace: operatorNamespace,
+    });
+    name = `eck-license-${Date.now()}`;
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+  }
+
+  try {
+    await core.createNamespacedSecret({
+      namespace: operatorNamespace,
+      body: {
+        apiVersion: "v1",
+        kind: "Secret",
+        metadata: {
+          name,
+          namespace: operatorNamespace,
+          labels: {
+            "license.k8s.elastic.co/scope": "operator",
+          },
+        },
+        type: "Opaque",
+        stringData: { license: trimmed },
+      },
+    });
+  } catch (err) {
+    if (isAlreadyExists(err)) {
+      name = `eck-license-${Date.now()}`;
+      await core.createNamespacedSecret({
+        namespace: operatorNamespace,
+        body: {
+          apiVersion: "v1",
+          kind: "Secret",
+          metadata: {
+            name,
+            namespace: operatorNamespace,
+            labels: {
+              "license.k8s.elastic.co/scope": "operator",
+            },
+          },
+          type: "Opaque",
+          stringData: { license: trimmed },
+        },
+      });
+    } else {
+      throw err;
+    }
+  }
+
   await new Promise((r) => setTimeout(r, 2_000));
   return getEckLicenseStatus();
 }
@@ -1604,4 +1823,50 @@ export async function getPodLogs(
     }
     throw err;
   }
+}
+
+export async function describePod(
+  namespace: string,
+  name: string,
+): Promise<{ name: string; namespace: string; describe: string }> {
+  const trimmedName = name.trim();
+  if (!trimmedName) {
+    throw httpError("pod name is required", 400);
+  }
+
+  const args = [
+    ...kubectlContextArgs(),
+    "-n",
+    namespace,
+    "describe",
+    "pod",
+    trimmedName,
+  ];
+
+  const output = await new Promise<string>((resolve, reject) => {
+    const child = spawn("kubectl", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => reject(err));
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+      reject(
+        httpError(
+          stderr.trim() || `kubectl describe exited with code ${code}`,
+          code === 1 ? 404 : 502,
+        ),
+      );
+    });
+  });
+
+  return { name: trimmedName, namespace, describe: output };
 }

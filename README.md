@@ -1,6 +1,6 @@
-# ECKgui
+# YAEU
 
-Local web UI for running an [Elastic Cloud on Kubernetes (ECK)](https://www.elastic.co/docs/deploy-manage/deploy/cloud-on-k8s) **quickstart** stack against the cluster in your kubeconfig.
+**Yet Another ECK UI.** Local web UI for running an [Elastic Cloud on Kubernetes (ECK)](https://www.elastic.co/docs/deploy-manage/deploy/cloud-on-k8s) **quickstart** stack against the cluster in your kubeconfig.
 
 It talks to Kubernetes through `kubectl`’s config (`~/.kube/config`). You can install the ECK operator, deploy Elasticsearch / Kibana / Logstash / Fleet Server / Elastic Agent as `quickstart` resources, change stack version, scale Elasticsearch, port-forward to ES and Kibana, and tear the stack down again.
 
@@ -26,7 +26,7 @@ Resource name is always `quickstart`. Elasticsearch uses `node.store.allow_mmap:
 - Ability to **pull Elastic images** (`docker.elastic.co/...`) from the cluster
 - Enough **node RAM** for the topology you pick (a 2–3 node Elasticsearch cluster plus Kibana is several GiB of *requests*; raise the VM memory in Rancher Desktop if pods stay `Pending`)
 
-You do **not** need the ECK operator installed beforehand. ECKgui can install it into `elastic-system`.
+You do **not** need the ECK operator installed beforehand **if** your user can create cluster-scoped RBAC (see [Installing the operator](#installing-the-operator)).
 
 The API binds to `127.0.0.1` only.
 
@@ -68,6 +68,19 @@ npm start
 
 Browsers keep Kibana Dev Tools history in **localStorage** for `https://localhost:5601`. Destroying the cluster does not clear that; use Console → History, or clear site data for that origin.
 
+## Installing the operator
+
+The official operator manifest creates ClusterRole `elastic-operator` with cluster-wide permissions. Kubernetes **will not** let you create that role unless you already have those permissions (privilege escalation prevention).
+
+On **GKE**, a Google account that can only work in a namespace typically gets `403 Forbidden` on install. You need `roles/container.admin` (or a `cluster-admin` ClusterRoleBinding), or ask someone who has that to apply the manifests:
+
+```bash
+kubectl apply -f https://download.elastic.co/downloads/eck/3.5.0/crds.yaml
+kubectl apply -f https://download.elastic.co/downloads/eck/3.5.0/operator.yaml
+```
+
+Use the same operator version you selected in the UI. After the operator is running in `elastic-system`, YAEU can deploy stack resources with ordinary namespace permissions.
+
 ## Upgrades and Elasticsearch topology
 
 - **Upgrade** patches only `spec.version`. Heap, node count, and Logstash pipelines stay as they are.
@@ -93,7 +106,7 @@ Pass means the Elasticsearch CR exists, ES health is green or yellow over HTTPS,
 ## Layout
 
 ```
-ECKgui/
+yaeu/
   server/   Fastify API + Kubernetes client
   web/      Vite + React UI
   scripts/  cluster smoke test

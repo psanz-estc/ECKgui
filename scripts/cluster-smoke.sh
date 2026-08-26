@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke-test the ECKgui quickstart stack on the current kubectl cluster.
+# Smoke-test the YAEU quickstart stack on the current kubectl cluster.
 #
 # Usage:
 #   npm run test:cluster
@@ -126,7 +126,7 @@ if [[ "$SKIP_HTTP" != "1" ]]; then
       bad "could not read ${RESOURCE}-es-elastic-user secret"
     else
       kc -n "$NS" port-forward "svc/${RESOURCE}-es-http" "${ES_LOCAL_PORT}:9200" \
-        >/tmp/eckgui-es-pf.log 2>&1 &
+        >/tmp/yaeu-es-pf.log 2>&1 &
       ES_PF_PID=$!
       if wait_tcp "$ES_LOCAL_PORT"; then
         body="$(curl -sk --max-time 15 -u "elastic:${PASS}" \
@@ -139,7 +139,7 @@ if [[ "$SKIP_HTTP" != "1" ]]; then
           printf '%s\n' "$body" | head -5
         fi
       else
-        bad "ES port-forward not ready (see /tmp/eckgui-es-pf.log)"
+        bad "ES port-forward not ready (see /tmp/yaeu-es-pf.log)"
       fi
     fi
   fi
@@ -151,10 +151,10 @@ if [[ "$SKIP_HTTP" != "1" ]]; then
     PASS="${PASS:-$(kc -n "$NS" get secret "${RESOURCE}-es-elastic-user" \
       -o jsonpath='{.data.elastic}' 2>/dev/null | base64 -d 2>/dev/null || true)}"
     kc -n "$NS" port-forward "svc/${RESOURCE}-kb-http" "${KB_LOCAL_PORT}:5601" \
-      >/tmp/eckgui-kb-pf.log 2>&1 &
+      >/tmp/yaeu-kb-pf.log 2>&1 &
     KB_PF_PID=$!
     if wait_tcp "$KB_LOCAL_PORT"; then
-      code="$(curl -sk --max-time 20 -o /tmp/eckgui-kb-status.json -w '%{http_code}' \
+      code="$(curl -sk --max-time 20 -o /tmp/yaeu-kb-status.json -w '%{http_code}' \
         -u "elastic:${PASS}" \
         "https://127.0.0.1:${KB_LOCAL_PORT}/api/status" || echo 000)"
       if [[ "$code" == "200" ]]; then
@@ -163,18 +163,18 @@ if [[ "$SKIP_HTTP" != "1" ]]; then
         bad "Kibana /api/status HTTP ${code}"
       fi
     else
-      bad "Kibana port-forward not ready (see /tmp/eckgui-kb-pf.log)"
+      bad "Kibana port-forward not ready (see /tmp/yaeu-kb-pf.log)"
     fi
   fi
 else
   section "HTTP checks skipped (SKIP_HTTP=1)"
 fi
 
-section "ECKgui API (optional)"
-if curl -sf --max-time 2 "http://127.0.0.1:8787/api/cluster" >/tmp/eckgui-api.json 2>/dev/null; then
-  ok "ECKgui API reachable on :8787"
+section "YAEU API (optional)"
+if curl -sf --max-time 2 "http://127.0.0.1:8787/api/cluster" >/tmp/yaeu-api.json 2>/dev/null; then
+  ok "YAEU API reachable on :8787"
 else
-  note "ECKgui API not running (npm run dev) — skipped"
+  note "YAEU API not running (npm run dev) — skipped"
 fi
 
 section "Summary"

@@ -16,6 +16,7 @@ import {
   upgradeFleetServer,
 } from "./fleet.js";
 import {
+  getEckApplyProgress,
   getEckOperatorStatus,
   installOrUpgradeEckOperator,
   listEckOperatorVersions,
@@ -39,13 +40,16 @@ import {
   getClusterMemory,
   getCredentials,
   getEckLicenseStatus,
+  applyEckEnterpriseLicense,
   getElasticsearchStatus,
   getErrorMessage,
   getKibanaStatus,
   getLogstashStatus,
   getPodLogs,
+  describePod,
   normalizeHeapSize,
   normalizeNodeCount,
+  restartPods,
   startEckTrial,
   switchKubeContext,
   watchClusterMemory,
@@ -263,6 +267,15 @@ app.get("/api/eck/operator", async (_req, reply) => {
   }
 });
 
+app.get("/api/eck/operator/progress", async (_req, reply) => {
+  try {
+    return getEckApplyProgress();
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
 app.get("/api/eck/operator/versions", async (_req, reply) => {
   try {
     return await listEckOperatorVersions();
@@ -321,6 +334,18 @@ app.post("/api/eck/license/trial", async (req, reply) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const acceptEula = body.acceptEula === true;
     return await startEckTrial({ acceptEula });
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/eck/license", async (req, reply) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const licenseJson =
+      typeof body.licenseJson === "string" ? body.licenseJson : "";
+    return await applyEckEnterpriseLicense(licenseJson);
   } catch (err) {
     reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
@@ -426,6 +451,17 @@ app.get("/api/pods/:name/logs", async (req, reply) => {
   }
 });
 
+app.get("/api/pods/:name/describe", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const name = decodeURIComponent((req.params as { name: string }).name);
+    return await describePod(namespace, name);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
 app.delete("/api/elasticsearch", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
@@ -433,6 +469,16 @@ app.delete("/api/elasticsearch", async (req, reply) => {
     return { ok: true };
   } catch (err) {
     reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/elasticsearch/restart", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await restartPods(namespace, "elasticsearch");
+  } catch (err) {
+    reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
   }
 });
@@ -478,6 +524,16 @@ app.delete("/api/kibana", async (req, reply) => {
     return { ok: true };
   } catch (err) {
     reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/kibana/restart", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await restartPods(namespace, "kibana");
+  } catch (err) {
+    reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
   }
 });
@@ -673,6 +729,16 @@ app.delete("/api/fleet-server", async (req, reply) => {
   }
 });
 
+app.post("/api/fleet-server/restart", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await restartPods(namespace, "fleet-server");
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
 app.get("/api/elastic-agent", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
@@ -702,6 +768,16 @@ app.delete("/api/elastic-agent", async (req, reply) => {
     return { ok: true };
   } catch (err) {
     reply.code(500);
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/elastic-agent/restart", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await restartPods(namespace, "elastic-agent");
+  } catch (err) {
+    reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };
   }
 });
@@ -769,7 +845,7 @@ process.on("SIGTERM", () => {
 
 try {
   await app.listen({ port: PORT, host: "127.0.0.1" });
-  console.log(`ECKgui API listening on http://127.0.0.1:${PORT}`);
+  console.log(`YAEU API listening on http://127.0.0.1:${PORT}`);
 } catch (err) {
   app.log.error(err);
   process.exit(1);

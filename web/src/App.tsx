@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
   EuiBadge,
-  EuiButton,
   EuiButtonEmpty,
   EuiCallOut,
   EuiHeader,
@@ -9,10 +8,12 @@ import {
   EuiHeaderSection,
   EuiHeaderSectionItem,
   EuiHeaderSectionItemButton,
+  EuiIcon,
   EuiPageTemplate,
   EuiSpacer,
   EuiText,
   type EuiBadgeProps,
+  type IconType,
 } from "@elastic/eui";
 import {
   DEFAULT_LOGSTASH_CONFIG,
@@ -36,6 +37,7 @@ import {
   getEckLicense,
   getEckOperator,
   getEckOperatorVersions,
+  getEckApplyProgress,
   getElasticAgent,
   getElasticsearch,
   getFleetExamples,
@@ -43,11 +45,14 @@ import {
   getKibana,
   getLogstash,
   getPodLogs,
+  getPodDescribe,
   getPortForwards,
   getStackVersions,
   installEckOperator,
+  restartInstance,
   setClusterContext,
   startEckTrialLicense,
+  applyEckEnterpriseLicense,
   startPortForward,
   uninstallEckOperator,
   upgradeAllQuickstart,
@@ -56,13 +61,14 @@ import {
   upgradeFleetServer,
   upgradeKibana,
   upgradeLogstash,
-  // findPortForwardState,
-  // stopPortForward,
+  findPortForwardState,
+  stopPortForward,
   type ClusterInfo,
   type ClusterMemory,
   type Credentials,
   type EckLicenseStatus,
   type EckOperatorStatus,
+  type EckApplyProgress,
   type FleetExampleMeta,
   type PortForwardState,
   type PortForwardStatus,
@@ -192,6 +198,54 @@ function memoryPressureStatus(
   return "normal";
 }
 
+const GKE_ADMIN_BINDING_EXAMPLE_NAME = "cluster-pablo-admin-binding";
+const GKE_ADMIN_BINDING_COMMAND = `kubectl create clusterrolebinding ${GKE_ADMIN_BINDING_EXAMPLE_NAME} --clusterrole=cluster-admin --user=$(gcloud auth list --filter=status:ACTIVE --format="value(account)")`;
+
+function looksLikeGke(cluster: ClusterInfo | null): boolean {
+  const hay = `${cluster?.context || ""} ${cluster?.server || ""}`.toLowerCase();
+  return (
+    hay.includes("gke_") ||
+    hay.includes("gke-") ||
+    hay.includes("container.googleapis.com")
+  );
+}
+
+function isEckClusterAdminError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("not allowed to create clusterrole") ||
+    m.includes("privilege escalation") ||
+    m.includes("rbac permissions not currently held") ||
+    m.includes("bind cluster-admin")
+  );
+}
+
+function CopyableCommand({ command }: { command: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="code-block">
+      <pre>
+        <code>{command}</code>
+      </pre>
+      <button
+        type="button"
+        className="ghost"
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(command);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 2000);
+          } catch {
+            setCopied(false);
+          }
+        }}
+      >
+        {copied ? "Copied" : "Copy"}
+      </button>
+    </div>
+  );
+}
+
 type PendingConfirm = {
   title: string;
   body: string;
@@ -257,9 +311,9 @@ function RamMeter({ memory }: { memory?: ClusterMemory }) {
     <div
       className={`ram-meter ram-meter-${status}`}
       title={title}
-      aria-label={`Memory requests ${label} ${pct} percent`}
+      aria-label={`Worker memory usage ${label} ${pct} percent`}
     >
-      <div className="ram-meter-label">Memory requests</div>
+      <div className="ram-meter-label">Worker memory usage</div>
       <div className="ram-meter-row">
         <span className="ram-meter-status">{label}</span>
         <div className="ram-meter-track" aria-hidden="true">
@@ -345,6 +399,39 @@ function eckPrimaryAction(eck: EckOperatorStatus | undefined, selected: string) 
   return { label: `Switch to ${selected}`, kind: "switch" as const };
 }
 
+function eckApplyPlan(
+  kind: "install" | "upgrade" | "switch",
+  version: string,
+): { summary: string; steps: string[]; notes: string[] } {
+  const crds = `https://download.elastic.co/downloads/eck/${version}/crds.yaml`;
+  const operator = `https://download.elastic.co/downloads/eck/${version}/operator.yaml`;
+  const steps = [
+    `Download official manifests for ${version} from download.elastic.co (CRDs, then operator.yaml).`,
+    kind === "switch"
+      ? "Because this is a downgrade, delete the currently running operator resources first. CRDs and existing Elastic CRs stay."
+      : "Keep the current operator in place while applying the new manifests (create or replace).",
+    `Apply CRDs from ${crds}. This registers/updates Elasticsearch, Kibana, and other Elastic APIs cluster-wide.`,
+    `Apply operator.yaml from ${operator}. This creates or updates namespace elastic-system, the elastic-operator ServiceAccount, ClusterRole, ClusterRoleBinding, and the operator Deployment.`,
+    "Wait briefly, then re-check whether the elastic-operator pod is Running.",
+  ];
+  const notes = [
+    "Creating ClusterRole elastic-operator requires cluster-admin. Without it, Kubernetes rejects the apply (privilege-escalation prevention).",
+    "On GKE, the IAM role is typically roles/container.admin, or a cluster-admin ClusterRoleBinding for your gcloud user.",
+  ];
+  if (kind === "upgrade" || kind === "switch") {
+    notes.unshift(
+      "Managed Elasticsearch and Kibana pods can rolling-restart after the operator version changes.",
+    );
+  }
+  const summary =
+    kind === "upgrade"
+      ? `Upgrade applies ECK ${version} in place. Existing CRs keep running while the operator restarts them if needed.`
+      : kind === "switch"
+        ? `Switch removes the current operator, then installs ${version}. CRDs are not deleted.`
+        : `This installs ECK ${version} using the official YAML, not a Helm chart.`;
+  return { summary, steps, notes };
+}
+
 function VersionPicker({
   id,
   listedLabel,
@@ -428,6 +515,10 @@ export default function App() {
   const [creds, setCreds] = useState<Credentials | null>(null);
   const [eckLicense, setEckLicense] = useState<EckLicenseStatus | null>(null);
   const [trialModalOpen, setTrialModalOpen] = useState(false);
+  const [licenseModalOpen, setLicenseModalOpen] = useState(false);
+  const [licenseJson, setLicenseJson] = useState<string | null>(null);
+  const [licenseFileName, setLicenseFileName] = useState("");
+  const licenseFileRef = useRef<HTMLInputElement>(null);
   const [eckOpen, setEckOpen] = useState(false);
   const [eckAutoOpened, setEckAutoOpened] = useState(false);
   const [eckOperatorVersion, setEckOperatorVersion] = useState("3.5.0");
@@ -435,6 +526,9 @@ export default function App() {
   const [eckApplyOpen, setEckApplyOpen] = useState(false);
   const [eckUninstallOpen, setEckUninstallOpen] = useState(false);
   const [eckDeleteCrds, setEckDeleteCrds] = useState(false);
+  const [gkeAdminHelpOpen, setGkeAdminHelpOpen] = useState(false);
+  const [eckApplyProgress, setEckApplyProgress] =
+    useState<EckApplyProgress | null>(null);
   const [portForwards, setPortForwards] = useState<PortForwardStatus>({
     es: emptyPortForward("es", 9200, "quickstart-es-http"),
     kibana: emptyPortForward("kibana", 5601, "quickstart-kb-http"),
@@ -466,6 +560,12 @@ export default function App() {
     podName: string;
     tailLines: number;
     logs: string;
+    loading: boolean;
+    error: string | null;
+  } | null>(null);
+  const [describeModal, setDescribeModal] = useState<{
+    podName: string;
+    output: string;
     loading: boolean;
     error: string | null;
   } | null>(null);
@@ -612,6 +712,31 @@ export default function App() {
     }
   }, [cluster, eckAutoOpened]);
 
+  useEffect(() => {
+    const watching = busy === "eck-install" || busy === "eck-uninstall";
+    if (!watching) {
+      setEckApplyProgress(null);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const next = await getEckApplyProgress();
+        if (!cancelled) setEckApplyProgress(next);
+      } catch {
+        // Progress is best-effort while the apply request is in flight.
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => {
+      void tick();
+    }, 400);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [busy]);
+
   async function run(
     label: string,
     action: () => Promise<string | void>,
@@ -622,7 +747,11 @@ export default function App() {
       const refreshNs = await action();
       await refreshAll(typeof refreshNs === "string" ? refreshNs : namespace);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      if (isEckClusterAdminError(message)) {
+        setGkeAdminHelpOpen(true);
+      }
     } finally {
       setBusy(null);
     }
@@ -687,6 +816,35 @@ export default function App() {
     void loadPodLogs(podName, logsModal?.tailLines || 200);
   }
 
+  async function loadPodDescribe(podName: string) {
+    setDescribeModal({
+      podName,
+      output: "",
+      loading: true,
+      error: null,
+    });
+    try {
+      const result = await getPodDescribe(namespace, podName);
+      setDescribeModal({
+        podName: result.name,
+        output: result.describe,
+        loading: false,
+        error: null,
+      });
+    } catch (err) {
+      setDescribeModal({
+        podName,
+        output: "",
+        loading: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  function openPodDescribe(podName: string) {
+    void loadPodDescribe(podName);
+  }
+
   const badge = overallBadge(es, kb, ls, fleetServer, elasticAgent);
   const deployedVersion =
     es.version ||
@@ -714,6 +872,20 @@ export default function App() {
       ? "Install a healthy ECK operator first"
       : undefined;
   const eckAction = eckPrimaryAction(cluster?.eck, eckOperatorVersion);
+  const eckPlan = eckApplyPlan(eckAction.kind, eckOperatorVersion);
+  const gkeCluster = looksLikeGke(cluster);
+  const applyPct =
+    eckApplyProgress && eckApplyProgress.total > 0
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round(
+              (eckApplyProgress.done / eckApplyProgress.total) * 100,
+            ),
+          ),
+        )
+      : null;
   const stackWouldDowngrade = [
     es.version,
     kb.version,
@@ -806,9 +978,10 @@ export default function App() {
               iconType="logoElastic"
               href="/"
               onClick={(e) => e.preventDefault()}
-              aria-label="ECKgui"
+              aria-label="YAEU, Yet Another ECK UI"
+              title="Yet Another ECK UI"
             >
-              ECKgui
+              YAEU
             </EuiHeaderLogo>
           </EuiHeaderSectionItem>
         </EuiHeaderSection>
@@ -833,7 +1006,7 @@ export default function App() {
         paddingSize="l"
         restrictWidth={1100}
         grow={false}
-        className="eckgui-page"
+        className="yaeu-page"
       >
         <EuiPageTemplate.Header
           pageTitle={
@@ -860,22 +1033,6 @@ export default function App() {
             >
               Refresh
             </EuiButtonEmpty>,
-            <EuiButton
-              key="kibana"
-              fill
-              iconType="popout"
-              isDisabled={portForwards.kibana.status !== "running"}
-              title={
-                portForwards.kibana.status !== "running"
-                  ? "Start the Kibana port-forward first"
-                  : undefined
-              }
-              onClick={() =>
-                window.open("https://localhost:5601", "_blank", "noreferrer")
-              }
-            >
-              Open Kibana
-            </EuiButton>,
           ]}
         />
 
@@ -883,7 +1040,7 @@ export default function App() {
           {error ? (
             <>
               <EuiCallOut title="Error" color="danger" iconType="warning">
-                <p>{error}</p>
+                <p className="error-text">{error}</p>
               </EuiCallOut>
               <EuiSpacer size="m" />
             </>
@@ -1049,11 +1206,28 @@ export default function App() {
           </button>
           {eckOpen ? (
             <div className="panel-body">
-              <p className="hint panel-hint">
-                The operator runs in <code>elastic-system</code>. Stack
-                workloads stay in the selected namespace. Installing or
-                upgrading the operator can rolling-restart managed pods.
-              </p>
+              <ul className="note-list">
+                <li>
+                  Operator runs in <code>elastic-system</code>. Stack workloads
+                  stay in the selected namespace.
+                </li>
+                <li>
+                  Installing or upgrading the operator can rolling-restart
+                  managed pods.
+                </li>
+                <li>
+                  Creating ClusterRole <code>elastic-operator</code> needs
+                  cluster-admin (GKE: <code>roles/container.admin</code>
+                  {gkeCluster ? " — this looks like a GKE context" : ""}).{" "}
+                  <button
+                    type="button"
+                    className="linkish"
+                    onClick={() => setGkeAdminHelpOpen(true)}
+                  >
+                    GKE cluster-admin command
+                  </button>
+                </li>
+              </ul>
               <div className="summary-grid">
                 <div className="summary-item">
                   <label>Context</label>
@@ -1116,10 +1290,55 @@ export default function App() {
                     >
                       Start Enterprise trial
                     </button>
+                    <button
+                      type="button"
+                      disabled={Boolean(busy) || !cluster?.eck?.ready}
+                      title={
+                        !cluster?.eck?.ready
+                          ? "ECK operator is not running"
+                          : "Apply an orchestration license JSON from Elastic"
+                      }
+                      onClick={() => licenseFileRef.current?.click()}
+                    >
+                      Upload Enterprise license
+                    </button>
+                    <input
+                      ref={licenseFileRef}
+                      type="file"
+                      accept=".json,application/json"
+                      hidden
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = "";
+                        if (!file) return;
+                        if (file.size > 1_000_000) {
+                          setError("License file is too large (max 1 MB).");
+                          return;
+                        }
+                        void file.text().then((text) => {
+                          try {
+                            const parsed = JSON.parse(text) as unknown;
+                            if (
+                              typeof parsed !== "object" ||
+                              parsed === null ||
+                              Array.isArray(parsed)
+                            ) {
+                              throw new Error("not an object");
+                            }
+                          } catch {
+                            setError("License file is not valid JSON.");
+                            return;
+                          }
+                          setLicenseFileName(file.name);
+                          setLicenseJson(text);
+                          setLicenseModalOpen(true);
+                        });
+                      }}
+                    />
                   </div>
                 </div>
               </div>
-              {cluster?.eck?.message ? (
+              {cluster?.eck?.message && cluster.eck.phase !== "running" ? (
                 <p className="hint panel-hint">{cluster.eck.message}</p>
               ) : null}
               <div className="deploy-actions">
@@ -1188,36 +1407,43 @@ export default function App() {
                 />
               </div>
               {!operatorReady ? (
-                <p className="hint panel-hint">
-                  {operatorNotReadyReason ||
-                    "Install a healthy ECK operator first"}
-                  . Open the ECK box to install or repair the operator.
-                </p>
+                <ul className="note-list">
+                  <li>
+                    {operatorNotReadyReason ||
+                      "Install a healthy ECK operator first"}
+                    . Open the ECK box to install or repair the operator.
+                  </li>
+                </ul>
               ) : null}
               {operatorReady && stackWouldDowngrade ? (
-                <p className="hint panel-hint">
-                  The typed stack version is lower than a running component.
-                  Elasticsearch data directories generally cannot downgrade.
-                </p>
-              ) : null}
-              {operatorReady && cluster?.eck?.version ? (
-                <p className="hint panel-hint">
-                  ECK operator {cluster.eck.version} must be compatible with
-                  stack {version}. Upgrade the operator in the ECK box first if
-                  it is too old.
-                </p>
+                <ul className="note-list">
+                  <li>
+                    The typed stack version is lower than a running component.
+                    Elasticsearch data directories generally cannot downgrade.
+                  </li>
+                </ul>
               ) : null}
               {operatorReady ? (
-                <p className="hint panel-hint">
-                  Upgrade patches only <code>spec.version</code>. Use Apply
-                  heap &amp; nodes to change JVM heap or node count without
-                  replacing the cluster. ECK rolling-upgrades Elasticsearch one
-                  node at a time only with at least 3 master-eligible nodes.
-                  With 1 or 2 nodes a version upgrade restarts the whole
-                  cluster at once (no quorum). Heap changes still roll one pod
-                  at a time. Scaling down deletes removed nodes&apos; data
-                  volumes.
-                </p>
+                <ul className="note-list">
+                  <li>
+                    The operator must be compatible with this stack version.
+                    Upgrade it in the ECK box first if it is too old.
+                  </li>
+                  <li>
+                    Upgrade patches only <code>spec.version</code>. Use{" "}
+                    <strong>Apply heap &amp; nodes</strong> to change JVM heap
+                    or node count without replacing the cluster.
+                  </li>
+                  <li>
+                    Rolling Elasticsearch upgrades need 3 or more
+                    master-eligible nodes. With 1 or 2 nodes a version upgrade
+                    restarts the whole cluster at once. Heap changes still roll
+                    one pod at a time.
+                  </li>
+                  <li>
+                    Scaling down deletes removed nodes&apos; data volumes.
+                  </li>
+                </ul>
               ) : null}
 
               <div className="stack-targets">
@@ -1395,6 +1621,20 @@ export default function App() {
                       <p className="hint panel-hint">
                         Deploys Kibana named quickstart against Elasticsearch.
                       </p>
+                      {es.exists &&
+                      es.version &&
+                      version &&
+                      es.version !== version ? (
+                        <EuiCallOut
+                          size="s"
+                          color="warning"
+                          title={`Elasticsearch is ${es.version}`}
+                        >
+                          Kibana {version} may not start or stay healthy on a
+                          different Elasticsearch version. Prefer matching
+                          stack versions.
+                        </EuiCallOut>
+                      ) : null}
                       <div className="deploy-actions">
                         <button
                           className="primary"
@@ -1416,9 +1656,18 @@ export default function App() {
                               title: kb.exists
                                 ? `Upgrade Kibana to ${version}?`
                                 : `Deploy Kibana ${version}?`,
-                              body: kb.exists
-                                ? `This patches spec.version on Kibana quickstart in ${namespace} from ${kb.version || "unknown"} to ${version}.`
-                                : `This creates Kibana quickstart in ${namespace} against Elasticsearch.`,
+                              body: [
+                                kb.exists
+                                  ? `This patches spec.version on Kibana quickstart in ${namespace} from ${kb.version || "unknown"} to ${version}.`
+                                  : `This creates Kibana quickstart in ${namespace} against Elasticsearch.`,
+                                es.exists &&
+                                es.version &&
+                                es.version !== version
+                                  ? `Warning: Elasticsearch is ${es.version}. Kibana ${version} may not work with a different Elasticsearch version.`
+                                  : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" "),
                               confirmLabel: kbAction.label,
                               busyKey: "kb-deploy",
                               action: async () => {
@@ -1836,23 +2085,47 @@ export default function App() {
             {es.exists ? (
               <InstanceCard
                 title="Elasticsearch"
+                logo="logoElasticsearch"
                 status={es}
-                endpoint="https://localhost:9200"
-                portForwardRunning={portForwards.es.status === "running"}
                 credentials={creds}
                 busy={busy}
-                onStartPortForward={() =>
-                  runPortForward("pf-es-start", async () => {
-                    await startPortForward("es", namespace);
+                serviceForwards={[
+                  {
+                    target: "es",
+                    label: "quickstart-es-http · https · 9200/TCP",
+                    href: "https://localhost:9200",
+                    state: portForwards.es,
+                  },
+                ]}
+                onStartServiceForward={(target) =>
+                  runPortForward(`pf-${target}-start`, async () => {
+                    await startPortForward(target, namespace);
+                  })
+                }
+                onStopServiceForward={(target) =>
+                  runPortForward(`pf-${target}-stop`, async () => {
+                    await stopPortForward(target);
                   })
                 }
                 onViewLogs={openPodLogs}
-                onRefresh={() => run("es-refresh", async () => refreshAll())}
+                onViewDescribe={openPodDescribe}
+                onRestart={() =>
+                  confirmRun({
+                    title: "Restart Elasticsearch?",
+                    body: `This deletes the Elasticsearch pods in ${namespace}. The Elasticsearch CR stays; ECK will recreate the pods.`,
+                    confirmLabel: "Restart",
+                    busyKey: "es-restart",
+                    action: async () => {
+                      await restartInstance("elasticsearch", namespace);
+                    },
+                  })
+                }
+                removeLabel="Remove"
                 onStop={() =>
                   confirmRun({
-                    title: "Stop Elasticsearch?",
+                    title: "Remove Elasticsearch?",
                     body: `This deletes Elasticsearch quickstart in ${namespace}. Data volumes may be removed depending on volumeClaimDeletePolicy.`,
-                    confirmLabel: "Stop Elasticsearch",
+                    confirmLabel: "Remove Elasticsearch",
                     danger: true,
                     busyKey: "es-delete",
                     action: async () => {
@@ -1865,22 +2138,46 @@ export default function App() {
             {kb.exists ? (
               <InstanceCard
                 title="Kibana"
+                logo="logoKibana"
                 status={kb}
-                endpoint="https://localhost:5601"
-                portForwardRunning={portForwards.kibana.status === "running"}
                 busy={busy}
-                onStartPortForward={() =>
-                  runPortForward("pf-kibana-start", async () => {
-                    await startPortForward("kibana", namespace);
+                serviceForwards={[
+                  {
+                    target: "kibana",
+                    label: "quickstart-kb-http · https · 5601/TCP",
+                    href: "https://localhost:5601",
+                    state: portForwards.kibana,
+                  },
+                ]}
+                onStartServiceForward={(target) =>
+                  runPortForward(`pf-${target}-start`, async () => {
+                    await startPortForward(target, namespace);
+                  })
+                }
+                onStopServiceForward={(target) =>
+                  runPortForward(`pf-${target}-stop`, async () => {
+                    await stopPortForward(target);
                   })
                 }
                 onViewLogs={openPodLogs}
-                onRefresh={() => run("kb-refresh", async () => refreshAll())}
+                onViewDescribe={openPodDescribe}
+                onRestart={() =>
+                  confirmRun({
+                    title: "Restart Kibana?",
+                    body: `This deletes the Kibana pods in ${namespace}. The Kibana CR stays; ECK will recreate the pods.`,
+                    confirmLabel: "Restart",
+                    busyKey: "kb-restart",
+                    action: async () => {
+                      await restartInstance("kibana", namespace);
+                    },
+                  })
+                }
+                removeLabel="Remove"
                 onStop={() =>
                   confirmRun({
-                    title: "Stop Kibana?",
+                    title: "Remove Kibana?",
                     body: `This deletes Kibana quickstart in ${namespace}.`,
-                    confirmLabel: "Stop Kibana",
+                    confirmLabel: "Remove Kibana",
                     danger: true,
                     busyKey: "kb-delete",
                     action: async () => {
@@ -1893,38 +2190,45 @@ export default function App() {
             {ls.exists ? (
               <InstanceCard
                 title="Logstash"
+                logo="logoLogstash"
                 status={ls}
                 busy={busy}
-                onViewLogs={openPodLogs}
-                onRefresh={() => run("ls-refresh", async () => refreshAll())}
-                onUpgrade={
-                  version && ls.version !== version
-                    ? {
-                        label: lsAction.label,
-                        disabled: Boolean(busy) || !operatorReady || !es.exists,
-                        title: !operatorReady
-                          ? operatorNotReadyReason
-                          : !es.exists
-                            ? "Elasticsearch must still exist to upgrade Logstash"
-                            : undefined,
-                        onClick: () =>
-                          confirmRun({
-                            title: `Upgrade Logstash to ${version}?`,
-                            body: `This patches spec.version on Logstash quickstart in ${namespace} from ${ls.version || "unknown"} to ${version}.`,
-                            confirmLabel: lsAction.label,
-                            busyKey: "ls-deploy",
-                            action: async () => {
-                              await upgradeLogstash(namespace, version);
-                            },
-                          }),
-                      }
-                    : undefined
+                serviceForwards={(ls.services || []).flatMap((svc) =>
+                  svc.ports.map((port) => ({
+                    target: port.forwardTarget,
+                    label: `${svc.name} · ${port.name} · ${port.port}/${port.protocol}`,
+                    href:
+                      port.port === 9600 || port.name === "api"
+                        ? `http://localhost:${port.port}`
+                        : undefined,
+                    state:
+                      findPortForwardState(portForwards, port.forwardTarget) ||
+                      emptyPortForward(
+                        port.forwardTarget,
+                        port.port,
+                        svc.name,
+                      ),
+                  })),
+                )}
+                onStartServiceForward={(target) =>
+                  runPortForward(`pf-${target}-start`, async () => {
+                    await startPortForward(target, namespace);
+                  })
                 }
+                onStopServiceForward={(target) =>
+                  runPortForward(`pf-${target}-stop`, async () => {
+                    await stopPortForward(target);
+                  })
+                }
+                onViewLogs={openPodLogs}
+                onViewDescribe={openPodDescribe}
+                onRefresh={() => run("ls-refresh", async () => refreshAll())}
+                removeLabel="Remove"
                 onStop={() =>
                   confirmRun({
-                    title: "Stop Logstash?",
+                    title: "Remove Logstash?",
                     body: `This deletes Logstash quickstart in ${namespace}.`,
-                    confirmLabel: "Stop Logstash",
+                    confirmLabel: "Remove Logstash",
                     danger: true,
                     busyKey: "ls-delete",
                     action: async () => {
@@ -1938,15 +2242,56 @@ export default function App() {
             {fleetServer.exists ? (
               <InstanceCard
                 title="Fleet Server"
+                logo="logoFleet"
                 status={fleetServer}
                 busy={busy}
+                serviceForwards={[
+                  {
+                    target: "svc:fleet-server-quickstart-agent-http:8220",
+                    label:
+                      "fleet-server-quickstart-agent-http · https · 8220/TCP",
+                    href: "https://localhost:8220",
+                    state:
+                      findPortForwardState(
+                        portForwards,
+                        "svc:fleet-server-quickstart-agent-http:8220",
+                      ) ||
+                      emptyPortForward(
+                        "svc:fleet-server-quickstart-agent-http:8220",
+                        8220,
+                        "fleet-server-quickstart-agent-http",
+                      ),
+                  },
+                ]}
+                onStartServiceForward={(target) =>
+                  runPortForward(`pf-${target}-start`, async () => {
+                    await startPortForward(target, namespace);
+                  })
+                }
+                onStopServiceForward={(target) =>
+                  runPortForward(`pf-${target}-stop`, async () => {
+                    await stopPortForward(target);
+                  })
+                }
                 onViewLogs={openPodLogs}
-                onRefresh={() => run("fs-refresh", async () => refreshAll())}
+                onViewDescribe={openPodDescribe}
+                onRestart={() =>
+                  confirmRun({
+                    title: "Restart Fleet Server?",
+                    body: `This deletes the Fleet Server pods in ${namespace}. The Agent CR stays; ECK will recreate the pods.`,
+                    confirmLabel: "Restart",
+                    busyKey: "fs-restart",
+                    action: async () => {
+                      await restartInstance("fleet-server", namespace);
+                    },
+                  })
+                }
+                removeLabel="Remove"
                 onStop={() =>
                   confirmRun({
-                    title: "Stop Fleet Server?",
+                    title: "Remove Fleet Server?",
                     body: `This deletes Fleet Server in ${namespace}.`,
-                    confirmLabel: "Stop Fleet Server",
+                    confirmLabel: "Remove Fleet Server",
                     danger: true,
                     busyKey: "fs-delete",
                     action: async () => {
@@ -1959,15 +2304,28 @@ export default function App() {
             {elasticAgent.exists ? (
               <InstanceCard
                 title="Elastic Agent"
+                logo="logoAgent"
                 status={elasticAgent}
                 busy={busy}
                 onViewLogs={openPodLogs}
-                onRefresh={() => run("ea-refresh", async () => refreshAll())}
+                onViewDescribe={openPodDescribe}
+                onRestart={() =>
+                  confirmRun({
+                    title: "Restart Elastic Agent?",
+                    body: `This deletes the Elastic Agent pods in ${namespace}. The Agent CR stays; ECK will recreate the pods.`,
+                    confirmLabel: "Restart",
+                    busyKey: "ea-restart",
+                    action: async () => {
+                      await restartInstance("elastic-agent", namespace);
+                    },
+                  })
+                }
+                removeLabel="Remove"
                 onStop={() =>
                   confirmRun({
-                    title: "Stop Elastic Agent?",
+                    title: "Remove Elastic Agent?",
                     body: `This deletes Elastic Agent in ${namespace}.`,
-                    confirmLabel: "Stop Elastic Agent",
+                    confirmLabel: "Remove Elastic Agent",
                     danger: true,
                     busyKey: "ea-delete",
                     action: async () => {
@@ -2162,6 +2520,68 @@ export default function App() {
         </div>
       ) : null}
 
+      {licenseModalOpen && licenseJson ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !busy) {
+              setLicenseModalOpen(false);
+              setLicenseJson(null);
+            }
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="license-modal-title"
+          >
+            <h2 id="license-modal-title">Upload Enterprise license?</h2>
+            <p className="hint">
+              This creates a license Secret in{" "}
+              <code>{eckLicense?.operatorNamespace || "elastic-system"}</code>{" "}
+              labeled <code>license.k8s.elastic.co/scope=operator</code>
+              {licenseFileName ? (
+                <>
+                  {" "}
+                  from <code>{licenseFileName}</code>
+                </>
+              ) : null}
+              . If a license Secret already exists, a new name is used so the
+              current license is not deleted.
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={() => {
+                  setLicenseModalOpen(false);
+                  setLicenseJson(null);
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={Boolean(busy)}
+                onClick={() =>
+                  run("eck-license", async () => {
+                    const next = await applyEckEnterpriseLicense(licenseJson);
+                    setEckLicense(next);
+                    setLicenseModalOpen(false);
+                    setLicenseJson(null);
+                  })
+                }
+              >
+                Apply license
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {eckApplyOpen ? (
         <div
           className="modal-backdrop"
@@ -2183,15 +2603,77 @@ export default function App() {
                   ? `Upgrade operator to ${eckOperatorVersion}?`
                   : `${eckAction.label}?`}
             </h2>
-            <p className="hint">
-              This applies official YAML manifests from download.elastic.co
-              (CRDs, then operator). The operator lives in{" "}
-              <code>elastic-system</code>. Upgrading can rolling-restart
-              managed Elasticsearch and Kibana pods.
-              {eckAction.kind === "switch"
-                ? " Downgrading removes the current operator first. Deleting CRDs is not part of this action."
-                : ""}
-            </p>
+            {busy === "eck-install" ? (
+              <div className="install-progress">
+                <p className="hint">
+                  {eckApplyProgress?.step ||
+                    "Applying official manifests from download.elastic.co…"}
+                </p>
+                {applyPct !== null ? (
+                  <div
+                    className="progress-track"
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={applyPct}
+                  >
+                    <div
+                      className="progress-fill"
+                      style={{ width: `${applyPct}%` }}
+                    />
+                  </div>
+                ) : (
+                  <div className="progress-track progress-track-indeterminate">
+                    <div className="progress-fill" />
+                  </div>
+                )}
+                {eckApplyProgress?.current?.kind ? (
+                  <p className="hint mono-hint">
+                    {eckApplyProgress.current.kind}{" "}
+                    {eckApplyProgress.current.namespace
+                      ? `${eckApplyProgress.current.namespace}/`
+                      : ""}
+                    {eckApplyProgress.current.name}
+                    {eckApplyProgress.total
+                      ? ` · ${eckApplyProgress.done}/${eckApplyProgress.total}`
+                      : ""}
+                  </p>
+                ) : null}
+              </div>
+            ) : (
+              <>
+                <p className="hint">{eckPlan.summary}</p>
+                <ol className="modal-steps">
+                  {eckPlan.steps.map((step) => (
+                    <li key={step}>{step}</li>
+                  ))}
+                </ol>
+                <div
+                  className={`modal-callout ${gkeCluster ? "modal-callout-warn" : ""}`}
+                >
+                  <p>
+                    The step that usually fails on GKE is applying ClusterRole{" "}
+                    <code>elastic-operator</code>. Kubernetes will not let a
+                    user grant RBAC they do not already hold. If that happens,
+                    bind <code>cluster-admin</code> to your active gcloud user,
+                    then retry. The ClusterRoleBinding name can be any unique
+                    value.
+                  </p>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => setGkeAdminHelpOpen(true)}
+                  >
+                    Show GKE cluster-admin command
+                  </button>
+                </div>
+                <ul className="modal-notes">
+                  {eckPlan.notes.map((note) => (
+                    <li key={note}>{note}</li>
+                  ))}
+                </ul>
+              </>
+            )}
             <div className="modal-actions">
               <button
                 type="button"
@@ -2212,7 +2694,49 @@ export default function App() {
                   })
                 }
               >
-                {eckAction.label}
+                {busy === "eck-install" ? "Installing…" : eckAction.label}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {gkeAdminHelpOpen ? (
+        <div
+          className="modal-backdrop modal-backdrop-stacked"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setGkeAdminHelpOpen(false);
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="gke-admin-modal-title"
+          >
+            <h2 id="gke-admin-modal-title">GKE cluster-admin binding</h2>
+            <p className="hint">
+              ECK install creates ClusterRole <code>elastic-operator</code>.
+              On GKE that typically needs IAM{" "}
+              <code>roles/container.admin</code>, or a Kubernetes{" "}
+              <code>cluster-admin</code> ClusterRoleBinding for the gcloud
+              user you are authenticated as.
+            </p>
+            <p className="hint">
+              The binding name is only an identifier.{" "}
+              <code>{GKE_ADMIN_BINDING_EXAMPLE_NAME}</code> is an example —
+              use any unique name if that one already exists.
+            </p>
+            <CopyableCommand command={GKE_ADMIN_BINDING_COMMAND} />
+            <p className="hint">
+              After the binding exists, retry the ECK install from this UI.
+              You can confirm with{" "}
+              <code>kubectl auth can-i create clusterroles</code>.
+            </p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setGkeAdminHelpOpen(false)}>
+                Close
               </button>
             </div>
           </div>
@@ -2235,27 +2759,57 @@ export default function App() {
             aria-labelledby="eck-uninstall-modal-title"
           >
             <h2 id="eck-uninstall-modal-title">Uninstall ECK operator?</h2>
-            <p className="hint">
-              This deletes the operator resources from{" "}
-              <code>elastic-system</code> using the official operator.yaml for{" "}
-              {cluster?.eck?.version || eckOperatorVersion}. Stack CRs stay
-              unless you also delete CRDs.
-            </p>
-            <label className="checkbox-inline">
-              <input
-                type="checkbox"
-                checked={eckDeleteCrds}
-                disabled={Boolean(busy)}
-                onChange={(e) => setEckDeleteCrds(e.target.checked)}
-              />
-              Also delete CRDs (removes all Elastic resources in all namespaces)
-            </label>
-            {eckDeleteCrds ? (
-              <p className="hint">
-                Deleting CRDs triggers deletion of Elasticsearch, Kibana,
-                Logstash, Agent, and related custom resources cluster-wide.
-              </p>
-            ) : null}
+            {busy === "eck-uninstall" ? (
+              <div className="install-progress">
+                <p className="hint">
+                  {eckApplyProgress?.step ||
+                    "Removing operator resources from elastic-system…"}
+                </p>
+                {applyPct !== null ? (
+                  <div
+                    className="progress-track"
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={applyPct}
+                  >
+                    <div
+                      className="progress-fill"
+                      style={{ width: `${applyPct}%` }}
+                    />
+                  </div>
+                ) : (
+                  <div className="progress-track progress-track-indeterminate">
+                    <div className="progress-fill" />
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
+                <p className="hint">
+                  This deletes the operator resources from{" "}
+                  <code>elastic-system</code> using the official operator.yaml
+                  for {cluster?.eck?.version || eckOperatorVersion}. Stack CRs
+                  stay unless you also delete CRDs.
+                </p>
+                <label className="checkbox-inline">
+                  <input
+                    type="checkbox"
+                    checked={eckDeleteCrds}
+                    disabled={Boolean(busy)}
+                    onChange={(e) => setEckDeleteCrds(e.target.checked)}
+                  />
+                  Also delete CRDs (removes all Elastic resources in all
+                  namespaces)
+                </label>
+                {eckDeleteCrds ? (
+                  <p className="hint">
+                    Deleting CRDs triggers deletion of Elasticsearch, Kibana,
+                    Logstash, Agent, and related custom resources cluster-wide.
+                  </p>
+                ) : null}
+              </>
+            )}
             <div className="modal-actions">
               <button
                 type="button"
@@ -2280,7 +2834,7 @@ export default function App() {
                   })
                 }
               >
-                Confirm uninstall
+                {busy === "eck-uninstall" ? "Uninstalling…" : "Confirm uninstall"}
               </button>
             </div>
           </div>
@@ -2461,6 +3015,46 @@ export default function App() {
           </div>
         </div>
       ) : null}
+
+      {describeModal ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !describeModal.loading) {
+              setDescribeModal(null);
+            }
+          }}
+        >
+          <div
+            className="modal logs-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="describe-modal-title"
+          >
+            <h2 id="describe-modal-title">
+              describe of <code>{describeModal.podName}</code>
+            </h2>
+            <div className="logs-controls">
+              <button
+                type="button"
+                disabled={describeModal.loading}
+                onClick={() => setDescribeModal(null)}
+              >
+                Close
+              </button>
+            </div>
+            {describeModal.error ? (
+              <p className="error">{describeModal.error}</p>
+            ) : null}
+            <pre className="logs-output">
+              {describeModal.loading
+                ? "Loading…"
+                : describeModal.output || "(no describe output)"}
+            </pre>
+          </div>
+        </div>
+      ) : null}
     </>
   );
 }
@@ -2522,29 +3116,63 @@ function PortForwardControls({
 }
 */
 
+/** EUI 118 has no logoFleet/logoAgent; productAgent is the Elastic Agent / Fleet mark. */
+function resolveProductLogo(logo: IconType): IconType {
+  if (logo === "logoFleet" || logo === "logoAgent") {
+    return "productAgent";
+  }
+  return logo;
+}
+
+function runningPortForwardUrls(
+  serviceForwards?: {
+    state: PortForwardState;
+    href?: string;
+  }[],
+): { href?: string; label: string }[] {
+  return (serviceForwards ?? [])
+    .filter((fwd) => fwd.state.status === "running")
+    .map((fwd) => ({
+      href: fwd.href,
+      label: fwd.href ?? `localhost:${fwd.state.localPort}`,
+    }));
+}
+
 function InstanceCard({
   title,
+  logo,
   status,
-  endpoint,
-  portForwardRunning,
   credentials,
   busy,
-  onStartPortForward,
+  serviceForwards,
+  onStartServiceForward,
+  onStopServiceForward,
   onViewLogs,
+  onViewDescribe,
   onRefresh,
+  onRestart,
   onUpgrade,
   onStop,
+  removeLabel = "Stop",
   onEditConfig,
 }: {
   title: string;
+  logo?: IconType;
   status: ResourceStatus;
-  endpoint?: string;
-  portForwardRunning?: boolean;
   credentials?: Credentials | null;
   busy: string | null;
-  onStartPortForward?: () => void;
+  serviceForwards?: {
+    target: string;
+    label: string;
+    state: PortForwardState;
+    href?: string;
+  }[];
+  onStartServiceForward?: (target: string) => void;
+  onStopServiceForward?: (target: string) => void;
   onViewLogs?: (podName: string) => void;
-  onRefresh: () => void;
+  onViewDescribe?: (podName: string) => void;
+  onRefresh?: () => void;
+  onRestart?: () => void;
   onUpgrade?: {
     label: string;
     disabled?: boolean;
@@ -2552,17 +3180,45 @@ function InstanceCard({
     onClick: () => void;
   };
   onStop: () => void;
+  removeLabel?: string;
   onEditConfig?: () => void;
 }) {
   const [credsOpen, setCredsOpen] = useState(false);
+  const [pfOpen, setPfOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
   const health = isTerminating(status)
     ? "Terminating"
     : status.health || status.phase || "pending";
-  const canOpen = Boolean(endpoint && portForwardRunning);
+  const forwardUrls = runningPortForwardUrls(serviceForwards);
+  const copyValue = forwardUrls
+    .map((item) => item.href ?? item.label)
+    .join("\n");
+
+  async function copyForwardUrl() {
+    if (!copyValue) return;
+    try {
+      await navigator.clipboard.writeText(copyValue);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   return (
     <article className="instance-card">
       <h3>
-        {title}
+        <span className="instance-title">
+          {logo ? (
+            <EuiIcon
+              className="instance-logo"
+              type={resolveProductLogo(logo)}
+              size="m"
+              aria-hidden
+            />
+          ) : null}
+          {title}
+        </span>
         <span className={`badge ${badgeClassForStatus(status)}`}>{health}</span>
       </h3>
       <div className="instance-meta">
@@ -2575,49 +3231,15 @@ function InstanceCard({
           <span>{status.nodes} nodes</span>
         ) : null}
       </div>
-      {credentials ? (
-        <div className="credentials-block">
+      <div className="instance-actions">
+        {credentials ? (
           <button
             type="button"
-            className="credentials-toggle"
+            disabled={Boolean(busy)}
             aria-expanded={credsOpen}
             onClick={() => setCredsOpen((open) => !open)}
           >
-            <span className="credentials-title">Access credentials</span>
-            <span className="chevron">{credsOpen ? "▾" : "▸"}</span>
-          </button>
-          {credsOpen ? (
-            <div className="meta">
-              <div>
-                <span>user</span>
-                <strong>{credentials.user || "elastic"}</strong>
-              </div>
-              <div>
-                <span>password</span>
-                <strong>
-                  {credentials.password || "(secret not available yet)"}
-                </strong>
-              </div>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-      <div className="instance-actions">
-        {canOpen ? (
-          <button
-            className="primary"
-            onClick={() => window.open(endpoint, "_blank", "noreferrer")}
-          >
-            Open
-          </button>
-        ) : null}
-        {endpoint && !canOpen && onStartPortForward ? (
-          <button
-            className="primary"
-            disabled={Boolean(busy)}
-            onClick={onStartPortForward}
-          >
-            Start port-forward
+            Credentials
           </button>
         ) : null}
         {onEditConfig ? (
@@ -2635,30 +3257,165 @@ function InstanceCard({
             {onUpgrade.label}
           </button>
         ) : null}
-        <button disabled={Boolean(busy)} onClick={onRefresh}>
-          Refresh
-        </button>
+        {onRestart ? (
+          <button disabled={Boolean(busy)} onClick={onRestart}>
+            Restart
+          </button>
+        ) : null}
+        {onRefresh ? (
+          <button disabled={Boolean(busy)} onClick={onRefresh}>
+            Refresh
+          </button>
+        ) : null}
         <button className="danger" disabled={Boolean(busy)} onClick={onStop}>
-          Stop
+          {removeLabel}
         </button>
       </div>
+      {credentials && credsOpen ? (
+        <div className="credentials-details">
+          <div>
+            <span>user</span>
+            <strong>{credentials.user || "elastic"}</strong>
+          </div>
+          <div>
+            <span>password</span>
+            <strong>
+              {credentials.password || "(secret not available yet)"}
+            </strong>
+          </div>
+        </div>
+      ) : null}
+      {serviceForwards ? (
+        <div className="service-forwards">
+          <button
+            type="button"
+            className="credentials-toggle"
+            aria-expanded={pfOpen}
+            onClick={() => setPfOpen((open) => !open)}
+          >
+            <span className="service-forwards-title">Port-forward</span>
+            <span className="chevron">{pfOpen ? "▾" : "▸"}</span>
+          </button>
+          {pfOpen ? (
+            serviceForwards.length > 0 ? (
+              serviceForwards.map((fwd) => {
+                const running = fwd.state.status === "running";
+                return (
+                  <div key={fwd.target} className="service-port-row">
+                    <span className="service-port-label">{fwd.label}</span>
+                    <span
+                      className={`pf-status ${fwd.state.status}`}
+                      title={fwd.state.message || undefined}
+                    >
+                      {running ? (
+                        fwd.href ? (
+                          <a
+                            className="pod-forward-link"
+                            href={fwd.href}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            localhost:{fwd.state.localPort}
+                          </a>
+                        ) : (
+                          `localhost:${fwd.state.localPort}`
+                        )
+                      ) : (
+                        fwd.state.status
+                      )}
+                    </span>
+                    {running ? (
+                      <button
+                        type="button"
+                        className="ghost pod-logs-btn"
+                        disabled={Boolean(busy)}
+                        onClick={() => onStopServiceForward?.(fwd.target)}
+                      >
+                        Stop
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="ghost pod-logs-btn"
+                        disabled={Boolean(busy)}
+                        onClick={() => onStartServiceForward?.(fwd.target)}
+                      >
+                        Start
+                      </button>
+                    )}
+                  </div>
+                );
+              })
+            ) : (
+              <p className="hint">
+                No services found to port-forward.
+              </p>
+            )
+          ) : null}
+        </div>
+      ) : null}
       <ul className="pods">
         {status.pods.length === 0 && <li>No pods</li>}
         {status.pods.map((pod) => (
           <li key={pod.name} className="pod-row">
-            <span className="pod-name">{pod.name}</span>
-            <span>{pod.phase}</span>
-            <span>{pod.ready}</span>
-            <span>restarts {pod.restarts}</span>
-            {onViewLogs ? (
-              <button
-                type="button"
-                className="ghost pod-logs-btn"
-                disabled={Boolean(busy)}
-                onClick={() => onViewLogs(pod.name)}
-              >
-                Logs
-              </button>
+            <div className="pod-main">
+              <span className="pod-name">{pod.name}</span>
+              <span>{pod.phase}</span>
+              <span>{pod.ready}</span>
+              <span>restarts {pod.restarts}</span>
+              {onViewLogs ? (
+                <button
+                  type="button"
+                  className="ghost pod-logs-btn"
+                  disabled={Boolean(busy)}
+                  onClick={() => onViewLogs(pod.name)}
+                >
+                  Logs
+                </button>
+              ) : null}
+              {onViewDescribe ? (
+                <button
+                  type="button"
+                  className="ghost pod-logs-btn"
+                  disabled={Boolean(busy)}
+                  onClick={() => onViewDescribe(pod.name)}
+                >
+                  Describe
+                </button>
+              ) : null}
+            </div>
+            {forwardUrls.length > 0 ? (
+              <div className="pod-forward">
+                <span className="pod-forward-label">port-forward</span>
+                <span className="pod-forward-urls">
+                  {forwardUrls.map((item, index) => (
+                    <span key={item.label}>
+                      {index > 0 ? " · " : null}
+                      {item.href ? (
+                        <a
+                          className="pod-forward-link"
+                          href={item.href}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {item.label}
+                        </a>
+                      ) : (
+                        item.label
+                      )}
+                    </span>
+                  ))}
+                </span>
+                <button
+                  type="button"
+                  className="ghost pod-logs-btn pod-copy-btn"
+                  title={copied ? "Copied!" : "Copy port-forward URL"}
+                  aria-label={copied ? "Copied!" : "Copy port-forward URL"}
+                  onClick={() => void copyForwardUrl()}
+                >
+                  {copied ? "Copied!" : <EuiIcon type="copyClipboard" size="s" />}
+                </button>
+              </div>
             ) : null}
           </li>
         ))}
