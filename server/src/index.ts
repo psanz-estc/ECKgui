@@ -66,6 +66,18 @@ import {
   stopPortForward,
 } from "./portforward.js";
 import { loadKubeConfig } from "./kubeconfig.js";
+import { deleteBeats, deployBeats, getBeatsStatus } from "./beats.js";
+import {
+  deleteStackConfigPolicy,
+  deployStackConfigPolicy,
+  getStackConfigPolicy,
+} from "./stack-config-policy.js";
+import {
+  applySidecarMonitoring,
+  deleteSidecarMonitoring,
+  getSidecarMonitoring,
+  sidecarTargetFromBody,
+} from "./monitoring.js";
 
 function statusFromError(err: unknown): number {
   if (
@@ -606,6 +618,9 @@ app.delete("/api/logstash", async (req, reply) => {
 app.delete("/api/quickstart", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await deleteBeats(namespace);
+    await deleteStackConfigPolicy(namespace);
+    await deleteSidecarMonitoring(namespace);
     await deleteFleetResources(namespace);
     await destroyQuickstart(namespace);
     await stopAllPortForwards();
@@ -781,6 +796,109 @@ app.post("/api/elastic-agent/restart", async (req, reply) => {
   try {
     const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
     return await restartPods(namespace, "elastic-agent");
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/beats", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await getBeatsStatus(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/beats", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const version =
+      typeof body.version === "string" && body.version.trim()
+        ? body.version.trim()
+        : undefined;
+    const includePacketbeat =
+      typeof body.includePacketbeat === "boolean"
+        ? body.includePacketbeat
+        : undefined;
+    return await deployBeats(namespace, { version, includePacketbeat });
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/beats", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await deleteBeats(namespace);
+    return { ok: true };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/stack-config-policy", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await getStackConfigPolicy(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/stack-config-policy", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await deployStackConfigPolicy(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/stack-config-policy", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await deleteStackConfigPolicy(namespace);
+    return { ok: true };
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.get("/api/monitoring/sidecar", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    return await getSidecarMonitoring(namespace);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.post("/api/monitoring/sidecar", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    const target = sidecarTargetFromBody(req.body);
+    return await applySidecarMonitoring(namespace, target);
+  } catch (err) {
+    reply.code(statusFromError(err));
+    return { error: getErrorMessage(err) };
+  }
+});
+
+app.delete("/api/monitoring/sidecar", async (req, reply) => {
+  try {
+    const namespace = namespaceFromQuery(req.query as Record<string, unknown>);
+    await deleteSidecarMonitoring(namespace);
+    return { ok: true };
   } catch (err) {
     reply.code(statusFromError(err));
     return { error: getErrorMessage(err) };

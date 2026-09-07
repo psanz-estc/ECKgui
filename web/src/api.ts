@@ -576,6 +576,101 @@ export function stopPortForward(target: string) {
   );
 }
 
+export type BeatStatusList = {
+  version?: string;
+  beats: ResourceStatus[];
+};
+
+export function getBeats(namespace: string) {
+  return request<BeatStatusList>(
+    `/api/beats?namespace=${encodeURIComponent(namespace)}`,
+  );
+}
+
+export function deployBeats(
+  namespace: string,
+  options: { version?: string; includePacketbeat?: boolean } = {},
+) {
+  return request<BeatStatusList>(
+    `/api/beats?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "POST",
+      body: JSON.stringify(options),
+    },
+  );
+}
+
+export function deleteBeats(namespace: string) {
+  return request<{ ok: boolean }>(
+    `/api/beats?namespace=${encodeURIComponent(namespace)}`,
+    { method: "DELETE" },
+  );
+}
+
+export type StackConfigPolicyStatus = {
+  name: string;
+  exists: boolean;
+  phase?: string;
+  readyCount?: string;
+  message?: string;
+};
+
+export function getStackConfigPolicy(namespace: string) {
+  return request<StackConfigPolicyStatus>(
+    `/api/stack-config-policy?namespace=${encodeURIComponent(namespace)}`,
+  );
+}
+
+export function deployStackConfigPolicy(namespace: string) {
+  return request<StackConfigPolicyStatus>(
+    `/api/stack-config-policy?namespace=${encodeURIComponent(namespace)}`,
+    { method: "POST" },
+  );
+}
+
+export function deleteStackConfigPolicy(namespace: string) {
+  return request<{ ok: boolean }>(
+    `/api/stack-config-policy?namespace=${encodeURIComponent(namespace)}`,
+    { method: "DELETE" },
+  );
+}
+
+export type SidecarMonitorTarget = "self" | "quickstart-monitor";
+
+export type SidecarMonitoringStatus = {
+  enabled: boolean;
+  target?: SidecarMonitorTarget;
+  refName?: string;
+  elasticsearch: boolean;
+  kibana: boolean;
+};
+
+export function getSidecarMonitoring(namespace: string) {
+  return request<SidecarMonitoringStatus>(
+    `/api/monitoring/sidecar?namespace=${encodeURIComponent(namespace)}`,
+  );
+}
+
+export function applySidecarMonitoring(
+  namespace: string,
+  target: SidecarMonitorTarget = "self",
+) {
+  return request<SidecarMonitoringStatus>(
+    `/api/monitoring/sidecar?namespace=${encodeURIComponent(namespace)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ target }),
+    },
+  );
+}
+
+export function deleteSidecarMonitoring(namespace: string) {
+  return request<{ ok: boolean }>(
+    `/api/monitoring/sidecar?namespace=${encodeURIComponent(namespace)}`,
+    { method: "DELETE" },
+  );
+}
+
 export function findPortForwardState(
   status: PortForwardStatus,
   target: string,

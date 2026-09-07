@@ -46,7 +46,7 @@ Stack — pick a version, deploy individual products or the full quickstart:
 
 You do **not** need the ECK operator installed beforehand **if** your user can create cluster-scoped RBAC (see [Installing the operator](#installing-the-operator)).
 
-The API binds to `127.0.0.1` only.
+The API binds to `127.0.0.1` only. Scripts and other tools can call the same routes the UI uses (see [HTTP API](#http-api)).
 
 ## Install and run
 
@@ -129,4 +129,107 @@ yaeu/
   web/      Vite + React UI
   scripts/  cluster smoke test
   docs/     README screenshots
+```
+
+## HTTP API
+
+The UI is a client of `http://127.0.0.1:8787`. Confirm dialogs are UI-only; the API does not prompt. There is no “start a stopped CR”: **Remove** deletes the resource, **Deploy** creates it again (`POST`).
+
+Use `npm run dev` for UI + API, or `npm start` after `npm run build` for API only. Check the server with `GET /api/health`.
+
+Conventions:
+
+- Bind is localhost only.
+- Default namespace is `default`. Pass `?namespace=` on resource calls.
+- Resource name is always `quickstart`.
+- Heap values need units (`512m`, `1g`, `4g`). A bare `4` is rejected.
+- `GET /api/elasticsearch` returns `heapSize` when `ES_JAVA_OPTS` is set on the default nodeSet (configured JVM heap for pod creation, not live RSS).
+
+### Routes
+
+| Action | Method | Path |
+| --- | --- | --- |
+| Health | GET | `/api/health` |
+| Cluster / memory | GET | `/api/cluster`, `/api/cluster/memory` |
+| Switch kube context | POST | `/api/cluster/context` |
+| Namespaces | POST DELETE | `/api/namespaces`, `/api/namespaces/:name` |
+| ECK operator | GET POST DELETE | `/api/eck/operator` |
+| License | GET POST | `/api/eck/license`, `/api/eck/license/trial` |
+| Credentials | GET | `/api/credentials?namespace=` |
+| Elasticsearch | GET POST PATCH DELETE | `/api/elasticsearch` |
+| Restart ES pods | POST | `/api/elasticsearch/restart` |
+| Kibana / Logstash / Fleet / Agent | GET POST PATCH DELETE | `/api/kibana`, `/api/logstash`, `/api/fleet-server`, `/api/elastic-agent` |
+| Deploy / upgrade / destroy stack | POST POST DELETE | `/api/quickstart/deploy-all`, `/api/quickstart/upgrade`, `/api/quickstart` |
+| Port-forward | GET POST DELETE | `/api/port-forward`, `/api/port-forward/:target` |
+| Pod logs / describe | GET | `/api/pods/:name/logs`, `/api/pods/:name/describe` |
+| Beats (no UI) | GET POST DELETE | `/api/beats` |
+| StackConfigPolicy (no UI) | GET POST DELETE | `/api/stack-config-policy` |
+| Sidecar monitoring (no UI) | GET POST DELETE | `/api/monitoring/sidecar` |
+
+Port-forward `target` values: `es`, `kibana`, or `svc:<service>:<port>`.
+
+PATCH Elasticsearch topology: `{ "heapSize": "4g", "nodeCount": 1 }`.
+
+Beats POST may include `{ "version": "9.4.5", "includePacketbeat": false }`. Version defaults to the Elasticsearch CR.
+
+Sidecar POST body: `{ "target": "self" }` (default) or `"quickstart-monitor"` if that ES CR already exists.
+
+StackConfigPolicy needs ECK 2.6+ and an Enterprise or trial license.
+
+Destroy-all (`DELETE /api/quickstart`) also removes Fleet, Beats, StackConfigPolicy, sidecar monitoring, and PVCs. Restart deletes pods; the CR stays.
+
+### curl examples
+
+Replace `default` if you use another namespace.
+
+```bash
+# Status and credentials
+curl -s http://127.0.0.1:8787/api/health
+curl -s 'http://127.0.0.1:8787/api/cluster'
+curl -s 'http://127.0.0.1:8787/api/elasticsearch?namespace=default'
+curl -s 'http://127.0.0.1:8787/api/credentials?namespace=default'
+
+# Deploy and topology
+curl -s -X POST 'http://127.0.0.1:8787/api/elasticsearch?namespace=default' \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"9.4.5","heapSize":"4g","nodeCount":1}'
+
+curl -s -X PATCH 'http://127.0.0.1:8787/api/elasticsearch?namespace=default' \
+  -H 'Content-Type: application/json' \
+  -d '{"heapSize":"4g","nodeCount":1}'
+
+curl -s -X POST 'http://127.0.0.1:8787/api/kibana?namespace=default' \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"9.4.5"}'
+
+curl -s -X POST 'http://127.0.0.1:8787/api/quickstart/deploy-all?namespace=default' \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"9.4.5","includeLogstash":false,"includeFleetServer":false,"heapSize":"4g","nodeCount":1}'
+
+# Restart, remove, destroy
+curl -s -X POST 'http://127.0.0.1:8787/api/elasticsearch/restart?namespace=default'
+curl -s -X DELETE 'http://127.0.0.1:8787/api/elasticsearch?namespace=default'
+curl -s -X DELETE 'http://127.0.0.1:8787/api/quickstart?namespace=default'
+
+# Port-forward, logs, describe
+curl -s -X POST 'http://127.0.0.1:8787/api/port-forward/es' \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace":"default"}'
+curl -s -X POST 'http://127.0.0.1:8787/api/port-forward/kibana' \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace":"default"}'
+curl -s http://127.0.0.1:8787/api/port-forward
+curl -s -X DELETE http://127.0.0.1:8787/api/port-forward/es
+
+curl -s 'http://127.0.0.1:8787/api/pods/quickstart-es-default-0/logs?namespace=default&tailLines=200'
+curl -s 'http://127.0.0.1:8787/api/pods/quickstart-es-default-0/describe?namespace=default'
+
+# Add-ons (API only)
+curl -s -X POST 'http://127.0.0.1:8787/api/beats?namespace=default' \
+  -H 'Content-Type: application/json' \
+  -d '{"includePacketbeat":true}'
+curl -s -X POST 'http://127.0.0.1:8787/api/stack-config-policy?namespace=default'
+curl -s -X POST 'http://127.0.0.1:8787/api/monitoring/sidecar?namespace=default' \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"self"}'
 ```

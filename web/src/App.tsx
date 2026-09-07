@@ -2116,6 +2116,7 @@ export default function App() {
                 title="Elasticsearch"
                 logo="logoElasticsearch"
                 status={es}
+                showHeap
                 credentials={creds}
                 busy={busy}
                 serviceForwards={[
@@ -3199,6 +3200,7 @@ function InstanceCard({
   title,
   logo,
   status,
+  showHeap,
   credentials,
   busy,
   serviceForwards,
@@ -3216,6 +3218,7 @@ function InstanceCard({
   title: string;
   logo?: IconType;
   status: ResourceStatus;
+  showHeap?: boolean;
   credentials?: Credentials | null;
   busy: string | null;
   serviceForwards?: {
@@ -3286,6 +3289,11 @@ function InstanceCard({
         <span>{status.name}</span>
         {typeof status.nodes === "number" ? (
           <span>{status.nodes} nodes</span>
+        ) : null}
+        {showHeap ? (
+          <span>
+            {status.heapSize ? `heap ${status.heapSize}` : "heap default"}
+          </span>
         ) : null}
       </div>
       <div className="instance-actions">
