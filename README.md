@@ -10,7 +10,7 @@ This is a laptop/lab tool, not a production control plane.
 
 - **Kubernetes** — pick kube context and namespace, create/delete namespaces, see how much RAM is already **requested** on the node (what the scheduler will allow, not live RSS).
 - **ECK** — install, upgrade, switch, or uninstall the operator from official YAML on `download.elastic.co`. Optional Enterprise trial.
-- **Stack** — pick a stack version (from Elastic’s artifacts API, or type a custom one). Deploy or upgrade Elasticsearch, Kibana, Logstash, Fleet Server, and Elastic Agent, or the full quickstart. Elasticsearch heap and node count can be applied without replacing the cluster.
+- **Stack** — pick a stack version (GitHub `elastic/elasticsearch` releases first, so tags usually exist on `docker.elastic.co`; you can still type a custom one). Deploy or upgrade Elasticsearch, Kibana, Logstash, Fleet Server, and Elastic Agent, or the full quickstart. Elasticsearch heap and node count can be applied without replacing the cluster.
 - **Instances** — health, pods, logs, `elastic` password, and start/stop port-forward to `https://localhost:9200` and `https://localhost:5601`.
 - **Destroy all** — delete the quickstart resources and their PVCs in the selected namespace.
 

@@ -1285,9 +1285,38 @@ export async function getCredentials(namespace: string): Promise<{
   };
 }
 
-function podPhase(pod: k8s.V1Pod): string {
+const POD_FAILURE_REASONS = new Set([
+  "ImagePullBackOff",
+  "ErrImagePull",
+  "InvalidImageName",
+  "CrashLoopBackOff",
+  "CreateContainerError",
+  "CreateContainerConfigError",
+]);
+
+function containerWaitReason(pod: k8s.V1Pod): string | undefined {
+  const statuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? []),
+  ];
+  for (const status of statuses) {
+    const waiting = status.state?.waiting?.reason;
+    if (waiting) return waiting;
+    const terminated = status.state?.terminated?.reason;
+    if (terminated && terminated !== "Completed") return terminated;
+  }
+  return undefined;
+}
+
+export function podPhase(pod: k8s.V1Pod): string {
   if (pod.metadata?.deletionTimestamp) return "Terminating";
-  return pod.status?.phase || "Unknown";
+  return containerWaitReason(pod) || pod.status?.phase || "Unknown";
+}
+
+export function failedPodMessage(pods: PodInfo[]): string | undefined {
+  const failed = pods.find((p) => POD_FAILURE_REASONS.has(p.phase));
+  if (!failed) return undefined;
+  return `Pod ${failed.name} is ${failed.phase}.`;
 }
 
 function withTerminatingHealth(

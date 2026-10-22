@@ -282,7 +282,7 @@ function ConfirmDialog({
       className="modal-backdrop"
       role="presentation"
       onClick={(e) => {
-        if (e.target === e.currentTarget && !busy) onCancel();
+        if (e.target === e.currentTarget) onCancel();
       }}
     >
       <div
@@ -294,8 +294,8 @@ function ConfirmDialog({
         <h2 id="confirm-modal-title">{pending.title}</h2>
         <p className="hint">{pending.body}</p>
         <div className="modal-actions">
-          <button type="button" disabled={Boolean(busy)} onClick={onCancel}>
-            Cancel
+          <button type="button" onClick={onCancel}>
+            {busy ? "Hide" : "Cancel"}
           </button>
           <button
             type="button"
@@ -303,7 +303,7 @@ function ConfirmDialog({
             disabled={Boolean(busy)}
             onClick={onConfirm}
           >
-            {pending.confirmLabel}
+            {busy ? "Working…" : pending.confirmLabel}
           </button>
         </div>
       </div>

@@ -85,18 +85,21 @@ async function fromGithubReleases(): Promise<string[]> {
 }
 
 export async function listElasticStackVersions(): Promise<StackVersionList> {
-  try {
-    const versions = await fromArtifactsApi();
-    const list = asList(versions, "artifacts");
-    if (list.source === "artifacts") return list;
-  } catch {
-    // try GitHub next
-  }
-
+  // GitHub releases first: those tags usually exist on docker.elastic.co.
+  // artifacts-api.elastic.co can list a GA version before the image is published
+  // (ImagePullBackOff, e.g. 9.5.4 before elasticsearch:9.5.4 exists).
   try {
     const versions = await fromGithubReleases();
     const list = asList(versions, "github");
     if (list.source === "github") return list;
+  } catch {
+    // try artifacts next
+  }
+
+  try {
+    const versions = await fromArtifactsApi();
+    const list = asList(versions, "artifacts");
+    if (list.source === "artifacts") return list;
   } catch {
     // fall through
   }

@@ -6,9 +6,11 @@ import {
   deployKibana,
   deployLogstash,
   getCredentials,
+  failedPodMessage,
   getElasticsearchStatus,
   getKibanaStatus,
   getLogstashStatus,
+  podPhase,
   patchCustomObjectVersion,
   statusWhileTerminatingPods,
   upgradeElasticsearch,
@@ -385,7 +387,19 @@ async function waitForKibanaGreen(
 ): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const kb = await getKibanaStatus(namespace);
+    const [kb, es] = await Promise.all([
+      getKibanaStatus(namespace),
+      getElasticsearchStatus(namespace),
+    ]);
+    const failed =
+      failedPodMessage(kb.pods) || failedPodMessage(es.pods);
+    if (failed) {
+      const err = new Error(
+        `${failed} Deploy cannot wait for Kibana while a pod is failing (often a missing image tag).`,
+      ) as Error & { statusCode: number };
+      err.statusCode = 502;
+      throw err;
+    }
     if (kb.exists && (kb.health || "").toLowerCase() === "green") {
       return;
     }
@@ -1195,8 +1209,7 @@ function podRestarts(pod: k8s.V1Pod): number {
 }
 
 function agentPodPhase(pod: k8s.V1Pod): string {
-  if (pod.metadata?.deletionTimestamp) return "Terminating";
-  return pod.status?.phase || "Unknown";
+  return podPhase(pod);
 }
 
 async function listAgentPods(
